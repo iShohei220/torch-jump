@@ -15,23 +15,25 @@ from model import GQN
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
     parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
-    parser.add_argument('--batch_size', type=int, default=36, help='size of batch (default: 36)')
+    parser.add_argument('--batch_size', type=int, default=10, help='size of batch (default: 10)')
     parser.add_argument('--dataset', type=str, default='Shepard-Metzler', help='dataset (dafault: Shepard-Mtzler)')
     parser.add_argument('--train_data_dir', type=str, help='location of training data', \
                         default="/workspace/dataset/shepard_metzler_7_parts-torch/train")
     parser.add_argument('--test_data_dir', type=str, help='location of test data', \
                         default="/workspace/dataset/shepard_metzler_7_parts-torch/test")
     parser.add_argument('--root_log_dir', type=str, help='root location of log', default='/workspace/logs')
-    parser.add_argument('--log_dir', type=str, help='log directory (default: GQN)', default='GQN')
+    parser.add_argument('--log_dir', type=str, help='log directory (default: GQN)', default='prior_batch')
     parser.add_argument('--log_interval', type=int, help='interval number of steps for logging', default=100)
     parser.add_argument('--save_interval', type=int, help='interval number of steps for saveing models', default=10000)
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=0)
     parser.add_argument('--device_ids', type=int, nargs='+', help='list of CUDA devices (default: [0])', default=[0])
-    parser.add_argument('--representation', type=str, help='representation network (default: pool)', default='pool')
+    parser.add_argument('--representation', type=str, help='representation network (default: pool)', default='tower')
     parser.add_argument('--layers', type=int, help='number of generative layers (default: 12)', default=12)
     parser.add_argument('--shared_core', type=bool, \
                         help='whether to share the weights of the cores across generation steps (default: False)', \
-                        default=False)
+                        default=True)
+    parser.add_argument('--z_dim', type=int, default=3)
+    parser.add_argument('--M', type=int, help='M in test', default=3)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
     args = parser.parse_args()
 
@@ -64,10 +66,10 @@ if __name__ == '__main__':
     train_dataset = GQNDataset(root_dir=train_data_dir, target_transform=transform_viewpoint)
     test_dataset = GQNDataset(root_dir=test_data_dir, target_transform=transform_viewpoint)
     D = args.dataset
-
+    
     # Pixel standard-deviation
-    sigma_i, sigma_f = 2.0, 0.7
-    sigma = sigma_i
+#     sigma_i, sigma_f = 2.0, 0.7
+#     sigma = sigma_i
 
     # Number of scenes over which each weight update is computed
     B = args.batch_size
@@ -79,7 +81,7 @@ if __name__ == '__main__':
     S_max = args.gradient_steps
 
     # Define model
-    model = GQN(representation=args.representation, L=L, shared_core=args.shared_core).to(device)
+    model = GQN(L=L, shared_core=args.shared_core, z_dim=args.z_dim).to(device)
     if len(args.device_ids)>1:
         model = nn.DataParallel(model, device_ids=args.device_ids)
 
@@ -89,7 +91,7 @@ if __name__ == '__main__':
     kwargs = {'num_workers':num_workers, 'pin_memory': True} if torch.cuda.is_available() else {}
 
     train_loader = DataLoader(train_dataset, batch_size=B, shuffle=True, **kwargs)
-    test_loader = DataLoader(test_dataset, batch_size=B, shuffle=True, **kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, **kwargs)
 
     train_iter = iter(train_loader)
     x_data_test, v_data_test = next(iter(test_loader))
@@ -105,10 +107,10 @@ if __name__ == '__main__':
         x_data = x_data.to(device)
         v_data = v_data.to(device)
         x, v, x_q, v_q = sample_batch(x_data, v_data, D)
-        elbo = model(x, v, v_q, x_q, sigma)
+        train_elbo = model(x, v, v_q, x_q, 1.0).sum()
         
         # Logs
-        writer.add_scalar('train_loss', -elbo.mean(), t)
+        writer.add_scalar('train_elbo', -train_elbo, t)
              
         with torch.no_grad():
             # Write logs to TensorBoard
@@ -116,29 +118,30 @@ if __name__ == '__main__':
                 x_data_test = x_data_test.to(device)
                 v_data_test = v_data_test.to(device)
 
-                x_test, v_test, x_q_test, v_q_test = sample_batch(x_data_test, v_data_test, D, M=3, seed=0)
-                elbo_test = model(x_test, v_test, v_q_test, x_q_test, sigma)
+                x_test, v_test, x_q_test, v_q_test = sample_batch(x_data_test, v_data_test, D, M=args.M, seed=0)
+                test_elbo = model(x_test, v_test, v_q_test, x_q_test, 1.0).sum()
                 
                 if len(args.device_ids)>1:
-                    kl_test = model.module.kl_divergence(x_test, v_test, v_q_test, x_q_test)
-                    x_q_rec_test = model.module.reconstruct(x_test, v_test, v_q_test, x_q_test)
-                    x_q_hat_test = model.module.generate(x_test, v_test, v_q_test)
+                    test_kl = model.module.kl_divergence(x_test, v_test).sum()
+                    x_q_gen = model.module.generate(v_q_test)
+                    x_q_pred = model.module.predict(x_test, v_test, v_q_test)
                 else:
-                    kl_test = model.kl_divergence(x_test, v_test, v_q_test, x_q_test)
-                    x_q_rec_test = model.reconstruct(x_test, v_test, v_q_test, x_q_test)
-                    x_q_hat_test = model.generate(x_test, v_test, v_q_test)
+                    test_kl = model.kl_divergence(x_test, v_test).sum()
+                    x_q_gen = model.generate(v_q_test)
+                    x_q_pred = model.predict(x_test, v_test, v_q_test)
 
-                writer.add_scalar('test_loss', -elbo_test.mean(), t)
-                writer.add_scalar('test_kl', kl_test.mean(), t)
-                writer.add_image('test_ground_truth', make_grid(x_q_test, 6, pad_value=1), t)
-                writer.add_image('test_reconstruction', make_grid(x_q_rec_test, 6, pad_value=1), t)
-                writer.add_image('test_generation', make_grid(x_q_hat_test, 6, pad_value=1), t)
+                writer.add_scalar('test_elbo', -test_elbo, t)
+                writer.add_scalar('test_kl', test_kl, t)
+                writer.add_image('test_ground_truth', make_grid(x_q_test[0], 5, pad_value=1), t)
+                writer.add_image('test_prediction', make_grid(x_q_pred[0], 5, pad_value=1), t)
+                writer.add_image('test_generation', make_grid(x_q_gen[0], 5, pad_value=1), t)
 
             if t % save_interval_num == 0:
-                torch.save(model.state_dict(), log_dir + "/models/model-{}.pt".format(t))
+                state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
+                torch.save(state_dict, log_dir + "/models/model-{}.pt".format(t))
 
         # Compute empirical ELBO gradients
-        (-elbo.mean()).backward()
+        (-train_elbo).backward()
 
         # Update parameters
         optimizer.step()
@@ -148,7 +151,8 @@ if __name__ == '__main__':
         scheduler.step()
 
         # Pixel-variance annealing
-        sigma = max(sigma_f + (sigma_i - sigma_f)*(1 - t/(2e5)), sigma_f)
-        
-    torch.save(model.state_dict(), log_dir + "/models/model-final.pt")  
+#         sigma = max(sigma_f + (sigma_i - sigma_f)*(1 - t/(2e5)), sigma_f)
+                
+    state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
+    torch.save(state_dict, log_dir + "/models/model-final.pt")  
     writer.close()
