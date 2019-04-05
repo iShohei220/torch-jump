@@ -49,9 +49,10 @@ class GQNDataset(Dataset):
 
         return images, viewpoints
 
-def sample_batch(x_data, v_data, D, M=None, seed=None):
+def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
     random.seed(seed)
     
+    x_q, v_q = x_data, v_data
     if D == "Room":
         K = 5
     elif D == "Jaco":
@@ -66,9 +67,10 @@ def sample_batch(x_data, v_data, D, M=None, seed=None):
         M = random.randint(1, K)
 
     context_idx = random.sample(range(x_data.size(1)), M)
-#     query_idx = random.randint(0, x_data.size(1)-1)
+    query_idx = random.sample(range(x_data.size(1)), K)
 
     # Sample view
     x, v = x_data[:, context_idx], v_data[:, context_idx]
+    x_q, v_q = x_data[:, query_idx], v_data[:, query_idx]
     
-    return x, v, x_data, v_data
+    return x, v, x_q, v_q, K

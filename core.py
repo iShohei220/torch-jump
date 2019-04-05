@@ -33,8 +33,8 @@ class GenerationCore(nn.Module):
         
     def forward(self, v, c_g, h_g, u, z):
         K = v.size(1)
-        v = self.upsample_v(v.view(-1, 7, 1, 1))
         z = z.view(-1, 1, self.z_dim, 16, 16).repeat(1, K, 1, 1, 1).view(-1, self.z_dim, 16, 16)
+        v = self.upsample_v(v.view(-1, 7, 1, 1))
         c_g, h_g = self.core(torch.cat((v, z), dim=1), (c_g, h_g))
         u = self.upsample_h(h_g) + u
         
