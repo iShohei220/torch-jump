@@ -1,8 +1,4 @@
-# PyTorch implementation of Generative Query Network
-### Original Paper: Neural scene representation and rendering (Eslami, et al., 2018)
-#### https://deepmind.com/blog/neural-scene-representation-and-rendering
-
-![img](https://storage.googleapis.com/deepmind-live-cms/images/model.width-1100.png)
+# Neural Scene Generator
 
 #### Pixyz Implementation: https://github.com/masa-su/pixyzoo/tree/master/GQN
 
