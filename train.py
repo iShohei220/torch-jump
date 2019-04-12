@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
-from gqn_dataset import GQNDataset, Scene, transform_viewpoint, sample_batch
+from dataset import GQNDataset, SceneNet, Scene, transform_viewpoint, sample_batch
 from scheduler import AnnealingStepLR
 from model import NSG
 
@@ -17,24 +17,25 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
     parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
     parser.add_argument('--batch_size', type=int, default=36, help='size of batch (default: 36)')
-    parser.add_argument('--dataset', type=str, default='Shepard-Metzler', help='dataset (dafault: Shepard-Mtzler)')
+    parser.add_argument('--dataset', type=str, default='SceneNet', help='dataset (dafault: SceneNet)')
     parser.add_argument('--train_data_dir', type=str, help='location of training data', \
-                        default="/workspace/dataset/shepard_metzler_7_parts-torch/train")
+                        default="/workspace/data/SceneNet/train")
     parser.add_argument('--test_data_dir', type=str, help='location of test data', \
-                        default="/workspace/dataset/shepard_metzler_7_parts-torch/test")
+                        default="/workspace/data/SceneNet/test")
     parser.add_argument('--root_log_dir', type=str, help='root location of log', default='/workspace/logs')
-    parser.add_argument('--log_dir', type=str, help='log directory (default: NSG)', default='nsg')
+    parser.add_argument('--log_dir', type=str, help='log directory (default: NSG_PoE)', default='NSG_PoE')
     parser.add_argument('--log_interval', type=int, help='interval number of steps for logging', default=100)
     parser.add_argument('--save_interval', type=int, help='interval number of steps for saveing models', default=10000)
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=0)
     parser.add_argument('--device_ids', type=int, nargs='+', help='list of CUDA devices (default: [0])', default=[0])
-    parser.add_argument('--representation', type=str, help='representation network (default: pool)', default='tower')
+    parser.add_argument('--representation', type=str, help='representation network (default: tower)', default='tower')
     parser.add_argument('--layers', type=int, help='number of generative layers (default: 12)', default=12)
     parser.add_argument('--shared_core', type=bool, \
                         help='whether to share the weights of the cores across generation steps (default: True)', \
                         default=True)
     parser.add_argument('--z_dim', type=int, default=3)
-    parser.add_argument('--M', type=int, help='M in test', default=3)
+    parser.add_argument('--v_dim', type=int, default=6)
+    parser.add_argument('--M', type=int, help='M in test', default=10)
     parser.add_argument('--num_epoch', type=int, help='number of epochs', default=100)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
     args = parser.parse_args()
@@ -65,8 +66,8 @@ if __name__ == '__main__':
     writer = SummaryWriter(log_dir=os.path.join(log_dir,'runs'))
 
     # Dataset
-    train_dataset = GQNDataset(root_dir=train_data_dir, target_transform=transform_viewpoint)
-    test_dataset = GQNDataset(root_dir=test_data_dir, target_transform=transform_viewpoint)
+    train_dataset = SceneNet(root_dir=train_data_dir)
+    test_dataset = SceneNet(root_dir=test_data_dir)
     D = args.dataset
     
     # Pixel standard-deviation
@@ -85,7 +86,7 @@ if __name__ == '__main__':
     S_max = args.gradient_steps
 
     # Define model
-    model = NSG(L=L, shared_core=args.shared_core, z_dim=args.z_dim).to(device)
+    model = NSG(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
 
     if len(args.device_ids)>1:
         model = nn.DataParallel(model, device_ids=args.device_ids)
@@ -107,9 +108,9 @@ if __name__ == '__main__':
     # Training Iterations
     for epoch in range(args.num_epoch):
         if len(args.device_ids)>1:
-            model.module.sigma.param.requires_grad = True if epoch>10 else False
+            model.module.sigma.param.requires_grad = True if epoch>=10 else False
         else:
-            model.sigma.param.requires_grad = True if epoch>10 else False
+            model.sigma.param.requires_grad = True if epoch>=10 else False
             
         for t, (x_data, v_data) in enumerate(tqdm(train_loader)):
             model.train()
@@ -141,27 +142,31 @@ if __name__ == '__main__':
 
                     test_elbo, test_nll, test_kl = model(x_data_test, v_data_test, D)
 
+                    random.seed(0)
                     context_idx = random.sample(range(x_data_test.size(1)), M)
-                    sample_idx = random.sample(range(x_data_test.size(1)), 36)
+                    sample_idx = random.sample(range(x_data_test.size(1)), 20)
                     if len(args.device_ids)>1:
                         x_gen = model.module.generate(v_data_test[:, sample_idx])
                         x_pred = model.module.predict(x_data_test[:, context_idx], v_data_test[:, context_idx], v_data_test[:, sample_idx])
+                        x_rec = model.module.reconstruct(x_data_test[:, sample_idx], v_data_test[:, sample_idx])
                     else:
                         x_gen = model.generate(v_data_test[:, sample_idx])
                         x_pred = model.predict(x_data_test[:, context_idx], v_data_test[:, context_idx], v_data_test[:, sample_idx])
+                        x_rec = model.reconstruct(x_data_test[:, sample_idx], v_data_test[:, sample_idx])
             
                     writer.add_scalar('test_elbo', test_elbo.mean(), step)
                     writer.add_scalar('test_nll', test_nll.mean(), step)
                     writer.add_scalar('test_kl', test_kl.mean(), step)
-                    writer.add_image('test_ground_truth', make_grid(x_data_test[0, sample_idx], 6, pad_value=1), step)
-                    writer.add_image('test_prediction', make_grid(x_pred[0], 6, pad_value=1), step)
-                    writer.add_image('test_generation', make_grid(x_gen[0], 6, pad_value=1), step)
+                    writer.add_image('test_context', make_grid(x_data_test[0, context_idx], 5, pad_value=1), step)
+                    writer.add_image('test_ground_truth', make_grid(x_data_test[0, sample_idx], 5, pad_value=1), step)
+                    writer.add_image('test_prediction', make_grid(x_pred[0], 5, pad_value=1), step)
+                    writer.add_image('test_generation', make_grid(x_gen[0], 5, pad_value=1), step)
+                    writer.add_image('test_reconstruction', make_grid(x_rec[0], 5, pad_value=1), step)
 
-                if step % save_interval_num == 0:
-                    state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
-                    torch.save(state_dict, log_dir + "/models/model-{}.pt".format(step))
-                
             step += 1
+            
+        state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
+        torch.save(state_dict, log_dir + f"/models/model-{epoch}.pt")
                 
     state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
     torch.save(state_dict, log_dir + "/models/model-final.pt")  

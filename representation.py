@@ -25,7 +25,7 @@ class Pyramid(nn.Module):
         return r
     
 class Tower(nn.Module):
-    def __init__(self):
+    def __init__(self, v_dim):
         super(Tower, self).__init__()
         self.conv1 = nn.Conv2d(3, 256, kernel_size=2, stride=2)
         self.bn1 = nn.BatchNorm2d(256)
@@ -35,9 +35,9 @@ class Tower(nn.Module):
         self.bn3 = nn.BatchNorm2d(128)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=2, stride=2)
         self.bn4 = nn.BatchNorm2d(256)
-        self.conv5 = nn.Conv2d(256+7, 256, kernel_size=3, stride=1, padding=1)
+        self.conv5 = nn.Conv2d(256+v_dim, 256, kernel_size=3, stride=1, padding=1)
         self.bn5 = nn.BatchNorm2d(256)
-        self.conv6 = nn.Conv2d(256+7, 128, kernel_size=3, stride=1, padding=1)
+        self.conv6 = nn.Conv2d(256+v_dim, 128, kernel_size=3, stride=1, padding=1)
         self.bn6 = nn.BatchNorm2d(128)
         self.conv7 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
         self.bn7 = nn.BatchNorm2d(256)
@@ -45,6 +45,7 @@ class Tower(nn.Module):
         self.bn8 = nn.BatchNorm2d(256)
 
     def forward(self, x, v):
+        x = x.view(-1, 3, 64, 64)
         # Resisual connection
         skip_in  = F.relu(self.bn1(self.conv1(x)))
         skip_out = F.relu(self.bn2(self.conv2(skip_in)))
@@ -53,7 +54,7 @@ class Tower(nn.Module):
         r = F.relu(self.bn4(self.conv4(r))) + skip_out
 
         # Broadcast
-        v = v.view(v.size(0), 7, 1, 1).repeat(1, 1, 16, 16)
+        v = v.view(-1, v.size(2), 1, 1).repeat(1, 1, 16, 16)
         
         # Resisual connection
         # Concatenate
