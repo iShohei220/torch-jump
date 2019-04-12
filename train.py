@@ -36,7 +36,7 @@ if __name__ == '__main__':
     parser.add_argument('--z_dim', type=int, default=3)
     parser.add_argument('--v_dim', type=int, default=6)
     parser.add_argument('--M', type=int, help='M in test', default=10)
-    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=100)
+    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=10000)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
     args = parser.parse_args()
 
@@ -108,9 +108,9 @@ if __name__ == '__main__':
     # Training Iterations
     for epoch in range(args.num_epoch):
         if len(args.device_ids)>1:
-            model.module.sigma.param.requires_grad = True if epoch>=10 else False
+            model.module.sigma.param.requires_grad = True if epoch>=args.num_epoch//10 else False
         else:
-            model.sigma.param.requires_grad = True if epoch>=10 else False
+            model.sigma.param.requires_grad = True if epoch>=args.num_epoch else False
             
         for t, (x_data, v_data) in enumerate(tqdm(train_loader)):
             model.train()

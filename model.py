@@ -50,7 +50,7 @@ class NSG(nn.Module):
         # Prior initial state
         c_pi = x.new_zeros((B, 128, 16, 16))
         h_pi = x.new_zeros((B, 128, 16, 16))
-        z_pi = x.new_zeros((B, self.z_dim, 16, 16))
+        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
         
         # Inference initial state
 #         c_e = x.new_zeros((B, 128, 16, 16))
@@ -69,17 +69,14 @@ class NSG(nn.Module):
         for l in range(self.L):
             # Prior state update
             if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_pi, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
             else:
-                c_pi, h_pi = self.prior_core[l](z_pi, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
                 
             # Prior factor
             mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
-            
-            # Prior Sample
-            z_pi = pi.rsample()
             
             # Inference state update
             if self.shared_core:
@@ -108,8 +105,8 @@ class NSG(nn.Module):
                 
         # ELBO likelihood contribution update
 #         sigma = self.sigma.view(1, 1, 3, 64, 64).repeat(B, K, 1, 1, 1)
-        nll = - torch.sum(Normal(self.eta_g(u).view(B, M, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4])
-        elbo = N / M * nll + kl
+        nll = - torch.sum(Normal(self.eta_g(u).view(B, M, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4]) / M
+        elbo = N * nll + kl
 
         return elbo, nll, kl
     
@@ -163,7 +160,7 @@ class NSG(nn.Module):
         # Prior initial state
         c_pi = x.new_zeros((B, 128, 16, 16))
         h_pi = x.new_zeros((B, 128, 16, 16))
-        z_pi = x.new_zeros((B, self.z_dim, 16, 16))
+        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
         
         # Inference initial state
 #         c_e = x.new_zeros((B, 128, 16, 16))
@@ -181,17 +178,14 @@ class NSG(nn.Module):
         for l in range(self.L):
             # Prior state update
             if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_pi, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
             else:
-                c_pi, h_pi = self.prior_core[l](z_pi, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
                 
             # Prior factor
             mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
-            
-            # Prior Sample
-            z_pi = pi.rsample()
             
             # Inference state update
             if self.shared_core:
@@ -230,7 +224,7 @@ class NSG(nn.Module):
         # Prior initial state
         c_pi = x.new_zeros((B, 128, 16, 16))
         h_pi = x.new_zeros((B, 128, 16, 16))
-        z_pi = x.new_zeros((B, self.z_dim, 16, 16))
+        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
         
         # Inference initial state
 #         c_e = x.new_zeros((B, 128, 16, 16))
@@ -249,17 +243,14 @@ class NSG(nn.Module):
         for l in range(self.L):
             # Prior state update
             if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_pi, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
             else:
-                c_pi, h_pi = self.prior_core[l](z_pi, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
                 
             # Prior factor
             mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
-            
-            # Prior Sample
-            z_pi = pi.rsample()
             
             # Inference state update
             if self.shared_core:
