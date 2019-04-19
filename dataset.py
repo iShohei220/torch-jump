@@ -98,12 +98,12 @@ def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
         K = 20
 
     # Sample number of views
-    if not M:
-        M = random.randint(1, K)
+#     if not M:
+#         M = random.randint(1, K)
 
-    idx = random.sample(range(x_data.size(1)), M)
+    idx = random.sample(range(x_data.size(1)), K)
 
     # Sample view
     x, v = x_data[:, idx], v_data[:, idx]
     
-    return x, v
+    return x, v, K

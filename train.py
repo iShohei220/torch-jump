@@ -17,13 +17,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
     parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
     parser.add_argument('--batch_size', type=int, default=36, help='size of batch (default: 36)')
-    parser.add_argument('--dataset', type=str, default='SceneNet', help='dataset (dafault: SceneNet)')
+    parser.add_argument('--dataset', type=str, default='Shepard-Metzler', help='dataset (dafault: Shepard-Metzler)')
     parser.add_argument('--train_data_dir', type=str, help='location of training data', \
-                        default="/workspace/data/SceneNet/train")
+                        default="/workspace/data/GQN/shepard_metzler_7_parts-torch/train")
     parser.add_argument('--test_data_dir', type=str, help='location of test data', \
-                        default="/workspace/data/SceneNet/test")
+                        default="/workspace/data/GQN/shepard_metzler_7_parts-torch/test")
     parser.add_argument('--root_log_dir', type=str, help='root location of log', default='/workspace/logs')
-    parser.add_argument('--log_dir', type=str, help='log directory (default: NSG_PoE)', default='NSG_PoE')
+    parser.add_argument('--log_dir', type=str, help='log directory (default: NSG)', default='NSG')
     parser.add_argument('--log_interval', type=int, help='interval number of steps for logging', default=100)
     parser.add_argument('--save_interval', type=int, help='interval number of steps for saveing models', default=10000)
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=0)
@@ -34,9 +34,9 @@ if __name__ == '__main__':
                         help='whether to share the weights of the cores across generation steps (default: True)', \
                         default=True)
     parser.add_argument('--z_dim', type=int, default=3)
-    parser.add_argument('--v_dim', type=int, default=6)
-    parser.add_argument('--M', type=int, help='M in test', default=10)
-    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=10000)
+    parser.add_argument('--v_dim', type=int, default=5)
+    parser.add_argument('--M', type=int, help='M in test', default=3)
+    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=100)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
     args = parser.parse_args()
 
@@ -60,14 +60,16 @@ if __name__ == '__main__':
     log_dir = os.path.join(args.root_log_dir, args.log_dir)
     os.mkdir(log_dir)
     os.mkdir(os.path.join(log_dir, 'models'))
+    os.mkdir(os.path.join(log_dir, 'optimizers'))
+    
     os.mkdir(os.path.join(log_dir,'runs'))
 
     # TensorBoardX
     writer = SummaryWriter(log_dir=os.path.join(log_dir,'runs'))
 
     # Dataset
-    train_dataset = SceneNet(root_dir=train_data_dir)
-    test_dataset = SceneNet(root_dir=test_data_dir)
+    train_dataset = GQNDataset(root_dir=train_data_dir)
+    test_dataset = GQNDataset(root_dir=test_data_dir)
     D = args.dataset
     
     # Pixel standard-deviation
@@ -91,10 +93,12 @@ if __name__ == '__main__':
     if len(args.device_ids)>1:
         model = nn.DataParallel(model, device_ids=args.device_ids)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08)
+
 #     optimizer = torch.optim.Adam(model.parameters())
 
-    scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
+#     scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
 
     kwargs = {'num_workers':num_workers, 'pin_memory': True} if torch.cuda.is_available() else {}
 
@@ -107,16 +111,16 @@ if __name__ == '__main__':
     step = 0
     # Training Iterations
     for epoch in range(args.num_epoch):
-        if len(args.device_ids)>1:
-            model.module.sigma.param.requires_grad = True if epoch>=args.num_epoch//10 else False
-        else:
-            model.sigma.param.requires_grad = True if epoch>=args.num_epoch else False
+#         if len(args.device_ids)>1:
+#             model.module.sigma.param.requires_grad = True if epoch>=args.num_epoch//10 else False
+#         else:
+#             model.sigma.param.requires_grad = True if epoch>=args.num_epoch//10 else False
             
         for t, (x_data, v_data) in enumerate(tqdm(train_loader)):
             model.train()
-            x_data = x_data.to(device)
-            v_data = v_data.to(device)
-            train_elbo, train_nll, train_kl = model(x_data, v_data, D)
+            x, v, K = sample_batch(x_data, v_data, D)
+            x, v = x.to(device), v.to(device)
+            train_elbo, train_nll, train_kl = model(x, v)
 
             # Compute empirical ELBO gradients
             train_elbo.mean().backward()
@@ -126,7 +130,7 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             
             # Update optimizer state
-            scheduler.step()
+#             scheduler.step()
 
             # Logs
             writer.add_scalar('train_elbo', train_elbo.mean(), step)
@@ -137,28 +141,28 @@ if __name__ == '__main__':
                 model.eval()
                 # Write logs to TensorBoard
                 if step % log_interval_num == 0:
-                    x_data_test = x_data_test.to(device)
-                    v_data_test = v_data_test.to(device)
+                    x_test, v_test, K = sample_batch(x_data_test, v_data_test, D, seed=0)
+                    x_test, v_test = x_test.to(device), v_test.to(device)
 
-                    test_elbo, test_nll, test_kl = model(x_data_test, v_data_test, D)
+                    test_elbo, test_nll, test_kl = model(x_test, v_test)
 
                     random.seed(0)
-                    context_idx = random.sample(range(x_data_test.size(1)), M)
-                    sample_idx = random.sample(range(x_data_test.size(1)), 20)
+                    context_idx = random.sample(range(x_test.size(1)), M)
+                    x_context, v_context = x_test[:, context_idx], v_test[:, context_idx]
                     if len(args.device_ids)>1:
-                        x_gen = model.module.generate(v_data_test[:, sample_idx])
-                        x_pred = model.module.predict(x_data_test[:, context_idx], v_data_test[:, context_idx], v_data_test[:, sample_idx])
-                        x_rec = model.module.reconstruct(x_data_test[:, sample_idx], v_data_test[:, sample_idx])
+                        x_gen = model.module.generate(v_test)
+                        x_pred = model.module.predict(x_context, v_context, v_test)
+                        x_rec = model.module.reconstruct(x_test, v_test)
                     else:
-                        x_gen = model.generate(v_data_test[:, sample_idx])
-                        x_pred = model.predict(x_data_test[:, context_idx], v_data_test[:, context_idx], v_data_test[:, sample_idx])
-                        x_rec = model.reconstruct(x_data_test[:, sample_idx], v_data_test[:, sample_idx])
+                        x_gen = model.generate(v_test)
+                        x_pred = model.predict(x_context, v_context, v_test)
+                        x_rec = model.reconstruct(x_test, v_test)
             
                     writer.add_scalar('test_elbo', test_elbo.mean(), step)
                     writer.add_scalar('test_nll', test_nll.mean(), step)
                     writer.add_scalar('test_kl', test_kl.mean(), step)
-                    writer.add_image('test_context', make_grid(x_data_test[0, context_idx], 5, pad_value=1), step)
-                    writer.add_image('test_ground_truth', make_grid(x_data_test[0, sample_idx], 5, pad_value=1), step)
+                    writer.add_image('test_context', make_grid(x_context[0], 5, pad_value=1), step)
+                    writer.add_image('test_ground_truth', make_grid(x_test[0], 5, pad_value=1), step)
                     writer.add_image('test_prediction', make_grid(x_pred[0], 5, pad_value=1), step)
                     writer.add_image('test_generation', make_grid(x_gen[0], 5, pad_value=1), step)
                     writer.add_image('test_reconstruction', make_grid(x_rec[0], 5, pad_value=1), step)
@@ -167,6 +171,9 @@ if __name__ == '__main__':
             
         state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
         torch.save(state_dict, log_dir + f"/models/model-{epoch}.pt")
+        
+        optimizer_state_dict = optimizer.state_dict()
+        torch.save(optimizer_state_dict, log_dir + f"/optimizers/optimizer-{epoch}.pt")
                 
     state_dict = model.module.state_dict() if len(args.device_ids)>1 else model.state_dict()
     torch.save(state_dict, log_dir + "/models/model-final.pt")  

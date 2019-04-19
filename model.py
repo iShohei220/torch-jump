@@ -37,11 +37,8 @@ class NSG(nn.Module):
         self.sigma = Variance([3, 64, 64])
 
     # EstimateELBO
-    def forward(self, x_data, v_data, D):
-        B, N, *_ = x_data.size()
-        
-        x, v = sample_batch(x_data, v_data, D)
-        M = v.size(1)
+    def forward(self, x, v):
+        B, M, *_ = v.size()
         
         # Scene encoder
 #         r = torch.sum(self.phi(x.view(-1, 3, 64, 64), v.view(-1, 7)).view(B, -1, 256, 16, 16), dim=1)
@@ -105,8 +102,8 @@ class NSG(nn.Module):
                 
         # ELBO likelihood contribution update
 #         sigma = self.sigma.view(1, 1, 3, 64, 64).repeat(B, K, 1, 1, 1)
-        nll = - torch.sum(Normal(self.eta_g(u).view(B, M, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4]) / M
-        elbo = N * nll + kl
+        nll = - torch.sum(Normal(self.eta_g(u).view(B, M, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4])
+        elbo = nll + kl
 
         return elbo, nll, kl
     
@@ -279,19 +276,20 @@ class NSG(nn.Module):
 
         return torch.clamp(mu, 0, 1)
     
-    def poe(self, prior, posterior):
-        vars = torch.cat((prior.variance.view(-1,1,self.z_dim,16,16), posterior.variance), dim=1)
-        var = 1. / torch.sum(torch.reciprocal(vars), dim=1)
+    def poe(self, prior, posterior, eps=1e-8):
+        vars = torch.cat((prior.variance.view(-1,1,self.z_dim,16,16), posterior.variance), dim=1) + eps
+        var = 1. / torch.sum(torch.reciprocal(vars), dim=1) + eps
         locs = torch.cat((prior.loc.view(-1,1,self.z_dim,16,16), posterior.loc), dim=1)
         loc = torch.sum(locs/vars, dim=1) * var
         return Normal(loc, torch.sqrt(var))
     
 class Variance(nn.Module):
-    def __init__(self, size):
+    def __init__(self, size, eps=1e-8):
         super(Variance, self).__init__()
         self.param = nn.Parameter(torch.Tensor(*size))
         nn.init.constant_(self.param, 0)
+        self.eps = eps
         
     def forward(self):
-        sigma = torch.exp(0.5*self.param)
+        sigma = torch.sqrt(torch.exp(self.param) + self.eps)
         return sigma
