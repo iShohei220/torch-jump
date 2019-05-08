@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
 from dataset import GQNDataset, SceneNet, Scene, transform_viewpoint, sample_batch
 from scheduler import AnnealingStepLR
-from model import NSG
+from model import NSG, GQN, CGQN
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
@@ -39,6 +39,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_epoch', type=int, help='number of epochs', default=100)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
     args = parser.parse_args()
+    parser.add_argument('--model', type=str, help='which model to use (default: NSG)', default='NSG')
 
     device = f"cuda:{args.device_ids[0]}" if torch.cuda.is_available() else "cpu"
     
@@ -88,7 +89,12 @@ if __name__ == '__main__':
     S_max = args.gradient_steps
 
     # Define model
-    model = NSG(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
+    if args.model=='NSG':
+        model = NSG(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
+    elif args.model=='GQN':
+        model = GQN(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
+    elif args.model=='CGQN':
+        model = CGQN(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
 
     if len(args.device_ids)>1:
         model = nn.DataParallel(model, device_ids=args.device_ids)
@@ -118,7 +124,7 @@ if __name__ == '__main__':
             
         for t, (x_data, v_data) in enumerate(tqdm(train_loader)):
             model.train()
-            x, v, K = sample_batch(x_data, v_data, D)
+            x, v = sample_batch(x_data, v_data, D)
             x, v = x.to(device), v.to(device)
             train_elbo, train_nll, train_kl = model(x, v)
 
@@ -141,7 +147,7 @@ if __name__ == '__main__':
                 model.eval()
                 # Write logs to TensorBoard
                 if step % log_interval_num == 0:
-                    x_test, v_test, K = sample_batch(x_data_test, v_data_test, D, seed=0)
+                    x_test, v_test = sample_batch(x_data_test, v_data_test, D, seed=0)
                     x_test, v_test = x_test.to(device), v_test.to(device)
 
                     test_elbo, test_nll, test_kl = model(x_test, v_test)

@@ -106,4 +106,4 @@ def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
     # Sample view
     x, v = x_data[:, idx], v_data[:, idx]
     
-    return x, v, K
+    return x, v

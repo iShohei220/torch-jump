@@ -512,26 +512,29 @@ class CGQN(nn.Module):
         return torch.clamp(mu, 0, 1)
     
 class GQN(nn.Module):
-    def __init__(self, L=12, shared_core=True):
+    def __init__(self, L=12, shared_core=True, z_dim=3, v_dim=5):
         super(GQN, self).__init__()
+        
+        self.z_dim = z_dim
+        self.v_dim = v_dim
         
         # Number of generative layers
         self.L = L
                 
         # Representation network
-        self.phi = Tower()
+        self.phi = Tower(v_dim=v_dim)
             
         # Generation network
         self.shared_core = shared_core
         if shared_core:
-            self.inference_core = InferenceCore()
-            self.generation_core = GenerationCoreGQN()
+            self.inference_core = InferenceCore(z_dim=z_dim)
+            self.generation_core = GenerationCoreGQN(z_dim=z_dim, v_dim=v_dim)
         else:
-            self.inference_core = nn.ModuleList([InferenceCore() for _ in range(L)])
-            self.generation_core = nn.ModuleList([GenerationCoreGQN() for _ in range(L)])
+            self.inference_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
+            self.generation_core = nn.ModuleList([GenerationCoreGQN(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
             
-        self.eta_e = nn.Conv2d(128, 2*3, kernel_size=5, stride=1, padding=2)
-        self.eta_pi = nn.Conv2d(128, 2*3, kernel_size=5, stride=1, padding=2)
+        self.eta_e = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
+        self.eta_pi = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
         self.eta_g = nn.Conv2d(128, 3, kernel_size=1, stride=1, padding=0)
         
         self.sigma = Variance([3, 64, 64])
@@ -562,12 +565,12 @@ class GQN(nn.Module):
         # Inference initial state
         c_e = x.new_zeros((B, 128, 16, 16))
         h_e = x.new_zeros((B, 128, 16, 16))
-        z = x.new_zeros((B, 128, 16, 16))
+        z = x.new_zeros((B, self.z_dim, 16, 16))
                 
         kl = 0
         for l in range(self.L):
             # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), 3, dim=1)
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
             
@@ -578,7 +581,7 @@ class GQN(nn.Module):
                 c_e, h_e = self.inference_core[l](z, r_T, c_e, h_e)
             
             # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), 3, dim=1)
+            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
             std_q = torch.exp(0.5*logvar_q)
             q = Normal(mu_q, std_q)
             
@@ -614,7 +617,7 @@ class GQN(nn.Module):
         
         for l in range(self.L):
             # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), 3, dim=1)
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
             
@@ -637,15 +640,16 @@ class GQN(nn.Module):
 
         # Scene encoder
         r = torch.sum(self.phi(x, v).view(B, -1, 256, 16, 16), dim=1)
-            
+        
+        # Inference initial state
+        c_e = x.new_zeros((B, 128, 16, 16))
+        h_e = x.new_zeros((B, 128, 16, 16))
+        
         # Generator initial state
         c_g = x.new_zeros((B*M, 128, 16, 16))
         h_g = x.new_zeros((B*M, 128, 16, 16))
         u = x.new_zeros((B*M, 128, 64, 64))
-
-        # Inference initial state
-        c_e = x.new_zeros((B, 128, 16, 16))
-        h_e = x.new_zeros((B, 128, 16, 16))
+        z = x.new_zeros((B, self.z_dim, 16, 16))
                 
         for l in range(self.L):
             # Inference state update
@@ -655,7 +659,7 @@ class GQN(nn.Module):
                 c_e, h_e = self.inference_core[l](z, r_T, c_e, h_e)
             
             # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), 3, dim=1)
+            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
             std_q = torch.exp(0.5*logvar_q)
             q = Normal(mu_q, std_q)
             
