@@ -87,7 +87,7 @@ def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
     
 #     x_q, v_q = x_data, v_data
     if D == "Room":
-        K = 5
+        K = 10
     elif D == "Jaco":
         K = 7
     elif D == "Labyrinth":
