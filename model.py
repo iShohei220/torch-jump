@@ -4,7 +4,7 @@ from torch.nn import functional as F
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from representation import Pyramid, Tower, Pool
-from core import PriorCore, InferenceCore, GenerationCore, InferenceCoreGQN, GenerationCoreGQN
+from core import PriorCore, InferenceCore, GenerationCore, GenerationCoreGQN
 from dataset import sample_batch
     
 class NSG(nn.Module):
