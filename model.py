@@ -1,10 +1,11 @@
+import random
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from representation import Pyramid, Tower, Pool
-from core import PriorCore, InferenceCore, GenerationCore, GenerationCoreGQN
+from core import PriorCore, InferenceCore, GenerationCore, InferenceCoreGQN, GenerationCoreGQN
 from dataset import sample_batch
     
 class NSG(nn.Module):
@@ -311,17 +312,15 @@ class CGQN(nn.Module):
         self.sigma = Variance([3, 64, 64])
 
     # EstimateELBO
-    def forward(self, x, v):
+    def forward(self, x, v, train):
         B, M, *_ = v.size()
         
-        K = random.randint(1, M)
-        indices = random.sample(range(M), K)
-        context_idx, query_idx = indices[:-1], indices[-1]
-        x_c, v_c = x[:, context_idx].view(B, -1, 3, 64, 64), v[:, context_idx].view(B, -1, self.v_dim)
-#         x_q, v_q = x[:, query_idx].view(B, -1, 3, 64, 64), v[:, query_idx].view(B, -1, self.v_dim)
+        K = random.randint(0, M)
+        context_idx = random.sample(range(M), K)
+        x_c, v_c = x[:, context_idx], v[:, context_idx]
         
         # Scene encoder
-        if x_c.size(1)>0:
+        if len(context_idx)>0 and train==True:
             r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
         else:
             r = x.new_zeros((B, 256, 16, 16))
@@ -388,7 +387,7 @@ class CGQN(nn.Module):
     def generate(self, v):
         B, K, *_ = v.size()
         
-        r = x.new_zeros((B, 256, 16, 16))
+        r = v.new_zeros((B, 256, 16, 16))
 
         # Prior initial state
         c_pi = v.new_zeros((B, 128, 16, 16))
@@ -434,14 +433,14 @@ class CGQN(nn.Module):
         r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
         
         # Inference initial state
-        c_e = x.new_zeros((B, 128, 16, 16))
-        h_e = x.new_zeros((B, 128, 16, 16))
-        z_e = x.new_zeros((B, self.z_dim, 16, 16))
+        c_e = x_c.new_zeros((B, 128, 16, 16))
+        h_e = x_c.new_zeros((B, 128, 16, 16))
+        z_e = x_c.new_zeros((B, self.z_dim, 16, 16))
         
         # Generator initial state
-        c_g = x.new_zeros((B*K, 128, 16, 16))
-        h_g = x.new_zeros((B*K, 128, 16, 16))
-        u = x.new_zeros((B*K, 128, 64, 64))
+        c_g = x_c.new_zeros((B*K, 128, 16, 16))
+        h_g = x_c.new_zeros((B*K, 128, 16, 16))
+        u = x_c.new_zeros((B*K, 128, 64, 64))
                 
         for l in range(self.L):
             # Inference state update
@@ -527,10 +526,10 @@ class GQN(nn.Module):
         # Generation network
         self.shared_core = shared_core
         if shared_core:
-            self.inference_core = InferenceCore(z_dim=z_dim)
+            self.inference_core = InferenceCoreGQN(z_dim=z_dim, v_dim=v_dim)
             self.generation_core = GenerationCoreGQN(z_dim=z_dim, v_dim=v_dim)
         else:
-            self.inference_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
+            self.inference_core = nn.ModuleList([InferenceCoreGQN(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
             self.generation_core = nn.ModuleList([GenerationCoreGQN(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
             
         self.eta_e = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
@@ -540,68 +539,93 @@ class GQN(nn.Module):
         self.sigma = Variance([3, 64, 64])
 
     # EstimateELBO
-    def forward(self, x, v):
+    def forward(self, x, v, train):
         B, M, *_ = v.size()
         
-        K = random.randint(1, M)
-        indices = random.sample(range(M), K)
-        context_idx, query_idx = indices[:-1], indices[-1]
-        x_c, v_c = x[:, context_idx].view(B, -1, 3, 64, 64), v[:, context_idx].view(B, -1, self.v_dim)
-#         x_q, v_q = x[:, query_idx].view(B, -1, 3, 64, 64), v[:, query_idx].view(B, -1, self.v_dim)
+        K = random.randint(0, M)
+        context_idx = random.sample(range(M), K)
+        x_c, v_c = x[:, context_idx], v[:, context_idx]
         
         # Scene encoder
-        if x_c.size(1)>0:
+        if len(context_idx)>0 and train==True:
             r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
         else:
             r = x.new_zeros((B, 256, 16, 16))
             
-        r_T = torch.sum(self.phi(x, v).view(B, -1, 256, 16, 16), dim=1)
-            
+        # Inference initial state
+        c_e = x.new_zeros((B*M, 128, 16, 16))
+        h_e = x.new_zeros((B*M, 128, 16, 16))
+                        
         # Generator initial state
         c_g = x.new_zeros((B*M, 128, 16, 16))
         h_g = x.new_zeros((B*M, 128, 16, 16))
         u = x.new_zeros((B*M, 128, 64, 64))
-
-        # Inference initial state
-        c_e = x.new_zeros((B, 128, 16, 16))
-        h_e = x.new_zeros((B, 128, 16, 16))
-        z = x.new_zeros((B, self.z_dim, 16, 16))
                 
         kl = 0
         for l in range(self.L):
             # Prior factor
             mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
+            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
             
             # Inference state update
             if self.shared_core:
-                c_e, h_e = self.inference_core(z, r_T, c_e, h_e)
+                c_e, h_e = self.inference_core(x, v, r, c_e, h_e, h_g, u)
             else:
-                c_e, h_e = self.inference_core[l](z, r_T, c_e, h_e)
+                c_e, h_e = self.inference_core[l](x, v, r, c_e, h_e, h_g, u)
             
             # Posterior factor
             mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
             std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q, std_q)
+            q = Normal(mu_q.view(B, -1, self.z_dim, 16, 16), std_q.view(B, -1, self.z_dim, 16, 16))
             
             # Posterior sample
             z = q.rsample()
             
             # Generator state update
             if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_q, r, c_g, h_g, u, z)
+                c_g, h_g, u = self.generation_core(v, r, c_g, h_g, u, z)
             else:
-                c_g, h_g, u = self.generation_core[l](v_q, r, c_g, h_g, u, z)
+                c_g, h_g, u = self.generation_core[l](v, r, c_g, h_g, u, z)
                 
             # KL contribution update
-            kl += torch.sum(kl_divergence(q, pi), dim=[1,2,3])
+            kl += torch.sum(kl_divergence(q, pi), dim=[1,2,3,4])
                 
         # likelihood contribution update
-        nll = - torch.sum(Normal(self.eta_g(u).view(B, -1, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3])
+        nll = - torch.sum(Normal(self.eta_g(u).view(B, -1, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4])
         elbo = nll + kl
 
         return elbo, nll, kl
+    
+    def generate(self, v):
+        B, M, *_ = v.size()
+
+        # Scene encoder
+        r = v.new_zeros((B, 256, 16, 16))
+        
+        # Generator initial state
+        c_g = v.new_zeros((B*M, 128, 16, 16))
+        h_g = v.new_zeros((B*M, 128, 16, 16))
+        u = v.new_zeros((B*M, 128, 64, 64))
+                
+        for l in range(self.L):
+            # Prior factor
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
+            std_pi = torch.exp(0.5*logvar_pi)
+            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
+            
+            # Prior sample
+            z = pi.sample()
+            
+            # Generator state update
+            if self.shared_core:
+                c_g, h_g, u = self.generation_core(v, r, c_g, h_g, u, z)
+            else:
+                c_g, h_g, u = self.generation_core[l](v, r, c_g, h_g, u, z)
+                
+        mu = self.eta_g(u).view(B, M, 3, 64, 64)
+
+        return torch.clamp(mu, 0, 1)
     
     def predict(self, x_c, v_c, v_q):
         B, M, *_ = x_c.size()
@@ -611,15 +635,15 @@ class GQN(nn.Module):
         r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
 
         # Initial state
-        c_g = x.new_zeros((B*K, 128, 16, 16))
-        h_g = x.new_zeros((B*K, 128, 16, 16))
-        u = x.new_zeros((B*K, 128, 64, 64))
+        c_g = x_c.new_zeros((B*K, 128, 16, 16))
+        h_g = x_c.new_zeros((B*K, 128, 16, 16))
+        u = x_c.new_zeros((B*K, 128, 64, 64))
         
         for l in range(self.L):
             # Prior factor
             mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
+            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
             
             # Prior sample
             z = pi.sample()
@@ -631,7 +655,7 @@ class GQN(nn.Module):
                 c_g, h_g, u = self.generation_core[l](v_q, r, c_g, h_g, u, z)
             
         # Image sample
-        mu = self.eta_g(u)
+        mu = self.eta_g(u).view(B, K, 3, 64, 64)
 
         return torch.clamp(mu, 0, 1)
     
@@ -641,38 +665,27 @@ class GQN(nn.Module):
         # Scene encoder
         r = torch.sum(self.phi(x, v).view(B, -1, 256, 16, 16), dim=1)
         
-        # Inference initial state
-        c_e = x.new_zeros((B, 128, 16, 16))
-        h_e = x.new_zeros((B, 128, 16, 16))
-        
         # Generator initial state
         c_g = x.new_zeros((B*M, 128, 16, 16))
         h_g = x.new_zeros((B*M, 128, 16, 16))
         u = x.new_zeros((B*M, 128, 64, 64))
-        z = x.new_zeros((B, self.z_dim, 16, 16))
                 
         for l in range(self.L):
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(z, r_T, c_e, h_e)
-            else:
-                c_e, h_e = self.inference_core[l](z, r_T, c_e, h_e)
+            # Prior factor
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
+            std_pi = torch.exp(0.5*logvar_pi)
+            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
             
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q, std_q)
-            
-            # Posterior sample
-            z = q.sample()
+            # Prior sample
+            z = pi.sample()
             
             # Generator state update
             if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_q, r, c_g, h_g, u, z)
+                c_g, h_g, u = self.generation_core(v, r, c_g, h_g, u, z)
             else:
-                c_g, h_g, u = self.generation_core[l](v_q, r, c_g, h_g, u, z)
+                c_g, h_g, u = self.generation_core[l](v, r, c_g, h_g, u, z)
                 
-        mu = self.eta_g(u)
+        mu = self.eta_g(u).view(B, M, 3, 64, 64)
 
         return torch.clamp(mu, 0, 1)
     

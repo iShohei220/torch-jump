@@ -38,8 +38,8 @@ if __name__ == '__main__':
     parser.add_argument('--M', type=int, help='M in test', default=3)
     parser.add_argument('--num_epoch', type=int, help='number of epochs', default=100)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
-    args = parser.parse_args()
     parser.add_argument('--model', type=str, help='which model to use (default: NSG)', default='NSG')
+    args = parser.parse_args()
 
     device = f"cuda:{args.device_ids[0]}" if torch.cuda.is_available() else "cpu"
     
@@ -126,7 +126,10 @@ if __name__ == '__main__':
             model.train()
             x, v = sample_batch(x_data, v_data, D)
             x, v = x.to(device), v.to(device)
-            train_elbo, train_nll, train_kl = model(x, v)
+            if args.model == "GQN" or args.model == "CGQN":
+                train_elbo, train_nll, train_kl = model(x, v, True)
+            else:
+                train_elbo, train_nll, train_kl = model(x, v)
 
             # Compute empirical ELBO gradients
             train_elbo.mean().backward()
@@ -149,8 +152,11 @@ if __name__ == '__main__':
                 if step % log_interval_num == 0:
                     x_test, v_test = sample_batch(x_data_test, v_data_test, D, seed=0)
                     x_test, v_test = x_test.to(device), v_test.to(device)
-
-                    test_elbo, test_nll, test_kl = model(x_test, v_test)
+                    
+                    if args.model == "GQN" or args.model == "CGQN":
+                        test_elbo, test_nll, test_kl = model(x_test, v_test, False)  
+                    else:
+                        test_elbo, test_nll, test_kl = model(x_test, v_test)
 
                     random.seed(0)
                     context_idx = random.sample(range(x_test.size(1)), M)
