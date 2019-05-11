@@ -285,7 +285,7 @@ class NSG(nn.Module):
         return Normal(loc, torch.sqrt(var))
     
 class CGQN(nn.Module):
-    def __init__(self, L=12, shared_core=True, z_dim=3, v_dim=5):
+    def __init__(self, L=12, shared_core=True, z_dim=3, v_dim=5, inference_split=True):
         super(CGQN, self).__init__()
         
         # Number of generative layers
@@ -293,7 +293,8 @@ class CGQN(nn.Module):
         
         self.z_dim = z_dim
         self.v_dim = v_dim
-                
+        self.inference_split = inference_split
+        
         # Representation network
         self.phi = Tower(v_dim=v_dim)
             
@@ -301,13 +302,19 @@ class CGQN(nn.Module):
         self.shared_core = shared_core
         if shared_core:
             self.inference_core = InferenceCore(z_dim=z_dim)
+            if inference_split:
+                self.prior_core = InferenceCore(z_dim=z_dim)
             self.generation_core = GenerationCore(z_dim=z_dim, v_dim=v_dim)
         else:
             self.inference_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
+            if inference_split:
+                self.prior_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
             self.generation_core = nn.ModuleList([GenerationCore(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
             
         self.eta_e = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
         self.eta_g = nn.Conv2d(128, 3, kernel_size=1, stride=1, padding=0)
+        if inference_split:
+            self.eta_pi = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
         
         self.sigma = Variance([3, 64, 64])
 
@@ -345,13 +352,13 @@ class CGQN(nn.Module):
         for l in range(self.L):
             # Prior state update
             if self.shared_core:
-                c_pi, h_pi = self.inference_core(z_e, r, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core(z_e, r, c_pi, h_pi) if self.inference_split else self.inference_core(z_e, r, c_pi, h_pi)
 
             else:
-                c_pi, h_pi = self.inference_core[l](z_e, r, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core[l](z_e, r, c_pi, h_pi) if self.inference_split else self.inference_core[l](z_e, r, c_pi, h_pi)
                 
             # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_e(h_pi), self.z_dim, dim=1)
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi) if self.inference_split else self.eta_e(h_pi), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
             
@@ -402,12 +409,13 @@ class CGQN(nn.Module):
         for l in range(self.L):
             # Prior state update
             if self.shared_core:
-                c_pi, h_pi = self.inference_core(z_pi, r, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core(z_pi, r, c_pi, h_pi) if self.inference_split else self.inference_core(z_pi, r, c_pi, h_pi)
+
             else:
-                c_pi, h_pi = self.inference_core[l](z_pi, r, c_pi, h_pi)
+                c_pi, h_pi = self.prior_core[l](z_pi, r, c_pi, h_pi) if self.inference_split else self.inference_core[l](z_pi, r, c_pi, h_pi)
                 
             # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_e(h_pi), self.z_dim, dim=1)
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi) if self.inference_split else self.eta_e(h_pi), self.z_dim, dim=1)
             std_pi = torch.exp(0.5*logvar_pi)
             pi = Normal(mu_pi, std_pi)
             
@@ -432,10 +440,10 @@ class CGQN(nn.Module):
         # Scene encoder
         r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
         
-        # Inference initial state
-        c_e = x_c.new_zeros((B, 128, 16, 16))
-        h_e = x_c.new_zeros((B, 128, 16, 16))
-        z_e = x_c.new_zeros((B, self.z_dim, 16, 16))
+        # Prior initial state
+        c_pi = x_c.new_zeros((B, 128, 16, 16))
+        h_pi = x_c.new_zeros((B, 128, 16, 16))
+        z_pi = x_c.new_zeros((B, self.z_dim, 16, 16))
         
         # Generator initial state
         c_g = x_c.new_zeros((B*K, 128, 16, 16))
@@ -443,19 +451,20 @@ class CGQN(nn.Module):
         u = x_c.new_zeros((B*K, 128, 64, 64))
                 
         for l in range(self.L):
-            # Inference state update
+            # Prior state update
             if self.shared_core:
-                c_e, h_e = self.inference_core(z_e, r, c_e, h_e)
+                c_pi, h_pi = self.prior_core(z_pi, r, c_pi, h_pi) if self.inference_split else self.inference_core(z_pi, r, c_pi, h_pi)
+
             else:
-                c_e, h_e = self.inference_core[l](z_e, r, c_e, h_e)
+                c_pi, h_pi = self.prior_core[l](z_pi, r, c_pi, h_pi) if self.inference_split else self.inference_core[l](z_pi, r, c_pi, h_pi)
+                
+            # Prior factor
+            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi) if self.inference_split else self.eta_e(h_pi), self.z_dim, dim=1)
+            std_pi = torch.exp(0.5*logvar_pi)
+            pi = Normal(mu_pi, std_pi)
             
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q, std_q)
-            
-            # Posterior sample
-            z_e = q.rsample()
+            # Prior sample
+            z_e = pi.rsample()
             
             # Generator state update
             if self.shared_core:
