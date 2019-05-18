@@ -17,11 +17,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
     parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
     parser.add_argument('--batch_size', type=int, default=36, help='size of batch (default: 36)')
-    parser.add_argument('--dataset', type=str, default='Shepard-Metzler', help='dataset (dafault: Shepard-Metzler)')
+    parser.add_argument('--dataset', type=str, default='Room', help='dataset (dafault: Room)')
     parser.add_argument('--train_data_dir', type=str, help='location of training data', \
-                        default="/workspace/data/GQN/shepard_metzler_7_parts-torch/train")
+                        default="/workspace/dataset/GQN/rooms_free_camera_with_object_rotations-torch/train")
     parser.add_argument('--test_data_dir', type=str, help='location of test data', \
-                        default="/workspace/data/GQN/shepard_metzler_7_parts-torch/test")
+                        default="/workspace/dataset/GQN/rooms_free_camera_with_object_rotations-torch/test")
     parser.add_argument('--root_log_dir', type=str, help='root location of log', default='/workspace/logs')
     parser.add_argument('--log_dir', type=str, help='log directory (default: NSG)', default='NSG')
     parser.add_argument('--log_interval', type=int, help='interval number of steps for logging', default=100)
@@ -29,14 +29,14 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=0)
     parser.add_argument('--device_ids', type=int, nargs='+', help='list of CUDA devices (default: [0])', default=[0])
     parser.add_argument('--representation', type=str, help='representation network (default: tower)', default='tower')
-    parser.add_argument('--layers', type=int, help='number of generative layers (default: 12)', default=12)
+    parser.add_argument('--layers', type=int, help='number of generative layers (default: 6)', default=6)
     parser.add_argument('--shared_core', type=bool, \
                         help='whether to share the weights of the cores across generation steps (default: True)', \
                         default=True)
     parser.add_argument('--z_dim', type=int, default=3)
     parser.add_argument('--v_dim', type=int, default=5)
-    parser.add_argument('--M', type=int, help='M in test', default=3)
-    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=100)
+    parser.add_argument('--M', type=int, help='M in test', default=5)
+    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=20)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
     parser.add_argument('--model', type=str, help='which model to use (default: NSG)', default='NSG')
     args = parser.parse_args()
@@ -74,8 +74,8 @@ if __name__ == '__main__':
     D = args.dataset
     
     # Pixel standard-deviation
-#     sigma_i, sigma_f = 2.0, 0.7
-#     sigma = sigma_i
+    sigma_i, sigma_f = 2.0, 0.7
+    sigma = sigma_i
 
     # Number of scenes over which each weight update is computed
     B = args.batch_size
@@ -99,17 +99,26 @@ if __name__ == '__main__':
     if len(args.device_ids)>1:
         model = nn.DataParallel(model, device_ids=args.device_ids)
 
+#     if args.model == "GQN" or args.model == "CGQN":
+    if args.model == "GQN":
+        # Pixel standard-deviation
+        sigma_i, sigma_f = 2.0, 0.7
+        sigma = sigma_i
+        
+        optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
+        scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08)
+
 #     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08)
-
-#     optimizer = torch.optim.Adam(model.parameters())
-
+#     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08)
+    
 #     scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
-
+    
     kwargs = {'num_workers':num_workers, 'pin_memory': True} if torch.cuda.is_available() else {}
 
     train_loader = DataLoader(train_dataset, batch_size=B, shuffle=True, **kwargs)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, **kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, **kwargs)
 
 #     train_iter = iter(train_loader)
     x_data_test, v_data_test = next(iter(test_loader))
@@ -117,16 +126,18 @@ if __name__ == '__main__':
     step = 0
     # Training Iterations
     for epoch in range(args.num_epoch):
-#         if len(args.device_ids)>1:
-#             model.module.sigma.param.requires_grad = True if epoch>=args.num_epoch//10 else False
-#         else:
-#             model.sigma.param.requires_grad = True if epoch>=args.num_epoch//10 else False
+        if len(args.device_ids)>1:
+            model.module.sigma.param.requires_grad = True if epoch>=args.num_epoch//2 else False
+        else:
+            model.sigma.param.requires_grad = True if epoch>=args.num_epoch//2 else False
             
         for t, (x_data, v_data) in enumerate(tqdm(train_loader)):
             model.train()
             x, v = sample_batch(x_data, v_data, D)
             x, v = x.to(device), v.to(device)
-            if args.model == "GQN" or args.model == "CGQN":
+            if args.model == "GQN":
+                train_elbo, train_nll, train_kl = model(x, v, sigma, True)
+            elif args.model == "CGQN":
                 train_elbo, train_nll, train_kl = model(x, v, True)
             else:
                 train_elbo, train_nll, train_kl = model(x, v)
@@ -137,6 +148,16 @@ if __name__ == '__main__':
             # Update parameters
             optimizer.step()
             optimizer.zero_grad()
+            
+#             # Pixel-variance annealing
+#             sigma = max(sigma_f + (sigma_i - sigma_f)*(1 - step/(2e5)), sigma_f)
+            
+#             if args.model == "GQN" or args.model == "CGQN":
+            if args.model == "GQN":
+                # Update optimizer state
+                scheduler.step()
+                # Pixel-variance annealing
+                sigma = max(sigma_f + (sigma_i - sigma_f)*(1 - step/(2e5)), sigma_f)
             
             # Update optimizer state
 #             scheduler.step()
@@ -153,14 +174,18 @@ if __name__ == '__main__':
                     x_test, v_test = sample_batch(x_data_test, v_data_test, D, seed=0)
                     x_test, v_test = x_test.to(device), v_test.to(device)
                     
-                    if args.model == "GQN" or args.model == "CGQN":
+                    if args.model == "GQN":
+                        test_elbo, test_nll, test_kl = model(x_test, v_test, sigma, False)
+                    elif args.model == "CGQN":
                         test_elbo, test_nll, test_kl = model(x_test, v_test, False)  
                     else:
                         test_elbo, test_nll, test_kl = model(x_test, v_test)
 
-                    random.seed(0)
-                    context_idx = random.sample(range(x_test.size(1)), M)
-                    x_context, v_context = x_test[:, context_idx], v_test[:, context_idx]
+#                     random.seed(0)
+#                     context_idx = random.sample(range(x_test.size(1)), M)
+#                     x_context, v_context = x_test[:, context_idx], v_test[:, context_idx]
+                    x_context, v_context = x_test[:, :M], v_test[:, :M]
+
                     if len(args.device_ids)>1:
                         x_gen = model.module.generate(v_test)
                         x_pred = model.module.predict(x_context, v_context, v_test)
@@ -173,11 +198,11 @@ if __name__ == '__main__':
                     writer.add_scalar('test_elbo', test_elbo.mean(), step)
                     writer.add_scalar('test_nll', test_nll.mean(), step)
                     writer.add_scalar('test_kl', test_kl.mean(), step)
-                    writer.add_image('test_context', make_grid(x_context[0], 5, pad_value=1), step)
-                    writer.add_image('test_ground_truth', make_grid(x_test[0], 5, pad_value=1), step)
-                    writer.add_image('test_prediction', make_grid(x_pred[0], 5, pad_value=1), step)
-                    writer.add_image('test_generation', make_grid(x_gen[0], 5, pad_value=1), step)
-                    writer.add_image('test_reconstruction', make_grid(x_rec[0], 5, pad_value=1), step)
+                    writer.add_image('test_context', make_grid(x_context.contiguous().view(-1, 3, 64, 64), M, pad_value=1), step)
+                    writer.add_image('test_ground_truth', make_grid(x_test.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
+                    writer.add_image('test_prediction', make_grid(x_pred.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
+                    writer.add_image('test_generation', make_grid(x_gen.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
+                    writer.add_image('test_reconstruction', make_grid(x_rec.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
 
             step += 1
             

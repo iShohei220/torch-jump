@@ -45,7 +45,7 @@ class Tower(nn.Module):
         self.bn8 = nn.BatchNorm2d(256)
 
     def forward(self, x, v):
-        x = x.view(-1, 3, 64, 64)
+        x = x.contiguous().view(-1, 3, 64, 64)
         # Resisual connection
         skip_in  = F.relu(self.bn1(self.conv1(x)))
         skip_out = F.relu(self.bn2(self.conv2(skip_in)))
@@ -54,7 +54,7 @@ class Tower(nn.Module):
         r = F.relu(self.bn4(self.conv4(r))) + skip_out
 
         # Broadcast
-        v = v.view(-1, v.size(2), 1, 1).repeat(1, 1, 16, 16)
+        v = v.contiguous().view(-1, v.size(2), 1, 1).repeat(1, 1, 16, 16)
         
         # Resisual connection
         # Concatenate
