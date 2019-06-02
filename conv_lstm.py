@@ -15,7 +15,7 @@ class Conv2dLSTMCell(nn.Module):
         self.state  = nn.Conv2d(in_channels, out_channels, **kwargs)
 
     def forward(self, input, states):
-        (cell, hidden) = states
+        (hidden, cell) = states
         input = torch.cat((hidden, input), dim=1)
         
         forget_gate = torch.sigmoid(self.forget(input))
@@ -27,5 +27,5 @@ class Conv2dLSTMCell(nn.Module):
         cell = forget_gate * cell + input_gate * state_gate
         hidden = output_gate * torch.tanh(cell)
 
-        return cell, hidden
-
+        return hidden, cell
+    

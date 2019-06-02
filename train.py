@@ -1,21 +1,19 @@
-import argparse
-import datetime
-import math
-import os
-import random
-from tqdm import tqdm
+import argparse, os, random
+
 from tensorboardX import SummaryWriter
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
-from dataset import GQNDataset, SceneNet, Scene, transform_viewpoint, sample_batch
-from scheduler import AnnealingStepLR
+from tqdm import tqdm
+
+from dataset import GQNDataset, Scene, transform_viewpoint, sample_batch
 from model import JUMP
+from scheduler import AnnealingStepLR
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
-    parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
+#     parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
     parser.add_argument('--batch_size', type=int, default=36, help='size of batch (default: 36)')
     parser.add_argument('--dataset', type=str, default='Room', help='dataset (dafault: Room)')
     parser.add_argument('--train_data_dir', type=str, help='location of training data', \
@@ -23,21 +21,18 @@ if __name__ == '__main__':
     parser.add_argument('--test_data_dir', type=str, help='location of test data', \
                         default="/workspace/dataset/GQN/rooms_free_camera_with_object_rotations-torch/test")
     parser.add_argument('--root_log_dir', type=str, help='root location of log', default='/workspace/logs')
-    parser.add_argument('--log_dir', type=str, help='log directory (default: NSG)', default='NSG')
+    parser.add_argument('--log_dir', type=str, help='log directory (default: JUMP)', default='JUMP')
     parser.add_argument('--log_interval', type=int, help='interval number of steps for logging', default=100)
     parser.add_argument('--save_interval', type=int, help='interval number of steps for saveing models', default=10000)
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=0)
     parser.add_argument('--device_ids', type=int, nargs='+', help='list of CUDA devices (default: [0])', default=[0])
-    parser.add_argument('--representation', type=str, help='representation network (default: tower)', default='tower')
     parser.add_argument('--layers', type=int, help='number of generative layers (default: 6)', default=6)
-    parser.add_argument('--shared_core', type=bool, \
-                        help='whether to share the weights of the cores across generation steps (default: True)', \
-                        default=True)
     parser.add_argument('--z_dim', type=int, default=3)
     parser.add_argument('--v_dim', type=int, default=5)
     parser.add_argument('--M', type=int, help='M in test', default=5)
-    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=20)
+    parser.add_argument('--num_epoch', type=int, help='number of epochs', default=40)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
+    args = parser.parse_args()
 
     device = f"cuda:{args.device_ids[0]}" if torch.cuda.is_available() else "cpu"
     
@@ -70,10 +65,6 @@ if __name__ == '__main__':
     train_dataset = GQNDataset(root_dir=train_data_dir)
     test_dataset = GQNDataset(root_dir=test_data_dir)
     D = args.dataset
-    
-    # Pixel standard-deviation
-    sigma_i, sigma_f = 2.0, 0.7
-    sigma = sigma_i
 
     # Number of scenes over which each weight update is computed
     B = args.batch_size
@@ -82,16 +73,31 @@ if __name__ == '__main__':
     
     # Hyperparameters
     if D=='Narratives':
-        nt=4, stride_to_hidden=2, nf_to_hidden=64, nf_enc=128, stride_to_obs=2, nf_to_obs=128, nf_dec=64, nf_z=3, nf_v=1, alpha=2.0, beta=0.5
+        nt=4
+        stride_to_hidden=2
+        nf_to_hidden=64
+        nf_enc=128
+        stride_to_obs=2
+        nf_to_obs=128
+        nf_dec=64
+        nf_z=3
+        nf_v=1
+        alpha=2.0
+        beta=0.5
 #     elif D=='MNISTDice':
     else:
-        nt=6, stride_to_hidden=2, nf_to_hidden=128, nf_enc=128, stride_to_obs=2, nf_to_obs=128, nf_dec=128, nf_z=3, nf_v=5
+        nt=6
+        stride_to_hidden=2
+        nf_to_hidden=128
+        nf_enc=128
+        stride_to_obs=2
+        nf_to_obs=128
+        nf_dec=128
+        nf_z=3
+        nf_v=5
 #     else:
 #         raise NotImplementedError
         
-    # Maximum number of training steps
-    S_max = args.gradient_steps
-
     # Define model
     model = JUMP(nt, stride_to_hidden, nf_to_hidden, nf_enc, stride_to_obs, nf_to_obs, nf_dec, nf_z, nf_v).to(device)
 
@@ -106,7 +112,6 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=B, shuffle=True, **kwargs)
     test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, **kwargs)
 
-#     train_iter = iter(train_loader)
     f_data_test, v_data_test = next(iter(test_loader))
     N = f_data_test.size(1)
 
@@ -118,8 +123,8 @@ if __name__ == '__main__':
             
             if D=='Narratives':
                 pixel_var = max(beta + (alpha - beta)*(1 - step/(1e5)), beta)
-#             elif D=='MNISTDice':
-            else
+            # elif D=='MNISTDice':
+            else:
                 if step < 1e5:
                     pixel_var = 2.0
                 elif step < 1.5e5:
@@ -128,8 +133,8 @@ if __name__ == '__main__':
                     pixel_var = 0.4
                 else:
                     pixel_var = 0.9
-#             else:
-#                 raise NotImplementedError
+            # else:
+                # raise NotImplementedError
                 
             f, v = sample_batch(f_data, v_data, D)
             f, v = f.to(device), v.to(device)
@@ -148,7 +153,7 @@ if __name__ == '__main__':
             # Logs
             writer.add_scalar('train_elbo', train_elbo.mean(), step)
             writer.add_scalar('train_kl', train_kl.mean(), step)
-            writer.add_scalar('train_mse', train_nll.mean(), step)
+            writer.add_scalar('train_mse', train_mse.mean(), step)
 
             with torch.no_grad():
                 model.eval()

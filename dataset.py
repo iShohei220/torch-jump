@@ -1,17 +1,10 @@
-import collections, os, io
+import collections, glob, io, os, random
+
 from PIL import Image
-# from accimage import Image
 import torch
+from torch.utils.data import Dataset
 import torchvision
 from torchvision.transforms import ToTensor, Resize, CenterCrop
-from torch.utils.data import Dataset
-import random
-import os
-import glob
-# import sys
-# sys.path.append('../')
-# from dataset.pySceneNetRGBD import scenenet_pb2 as sn
-# torchvision.set_image_backend('accimage')
 
 Context = collections.namedtuple('Context', ['frames', 'cameras'])
 Scene = collections.namedtuple('Scene', ['frames', 'cameras'])
@@ -61,47 +54,6 @@ class GQNDataset(Dataset):
 
         return images, viewpoints
     
-class SceneNet(Dataset):
-    def __init__(self, root_dir, transform=None, target_transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.target_transform = target_transform
-
-    def __len__(self):
-        return len(os.listdir(self.root_dir))
-
-    def __getitem__(self, idx):
-        scene_path = os.path.join(self.root_dir, f"{idx}.pt")
-        images, viewpoints = torch.load(scene_path)
-
-        if self.transform:
-            images = self.transform(images)
-
-        if self.target_transform:
-            viewpoints = self.target_transform(viewpoints)
-
-        return images, viewpoints
-    
-class KukaDataset(Dataset):
-    def __init__(self, root_dir="/workspace/dataset/CoRL2019/kuka_sim_small/scenes", clip_length=None):
-        self.root_dir = root_dir
-        self.clip_length = clip_length
-    
-    def __len__(self):
-        return len(os.listdir(self.root_dir))
-    
-    def __getitem__(self, idx):
-        scene_path = os.path.join(self.root_dir, f"{idx}.pt")
-        data = torch.load(scene_path)
-        images, viewpoints = data.frames, data.cameras
-        
-        if self.clip_length:
-            start = random.randint(0, len(images)-self.clip_length)
-            stop = start + self.clip_length
-            images, viewpoints = images[start:stop], viewpoints[start:stop]
-            
-        return images, viewpoints
-
 def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
     random.seed(seed)
     
@@ -114,12 +66,8 @@ def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
         K = 20
     elif D == "Shepard-Metzler":
         K = 15
-    elif D == "SceneNet":
-        K = 20
-
-    # Sample number of views
-#     if not M:
-#         M = random.randint(1, K)
+    else:
+        K = x_data.size(1)
 
     idx = random.sample(range(x_data.size(1)), K)
 
