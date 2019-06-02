@@ -7,6 +7,7 @@ from torchvision.transforms import ToTensor, Resize, CenterCrop
 from torch.utils.data import Dataset
 import random
 import os
+import glob
 # import sys
 # sys.path.append('../')
 # from dataset.pySceneNetRGBD import scenenet_pb2 as sn
@@ -81,6 +82,25 @@ class SceneNet(Dataset):
 
         return images, viewpoints
     
+class KukaDataset(Dataset):
+    def __init__(self, root_dir="/workspace/dataset/CoRL2019/kuka_sim_small/scenes", clip_length=None):
+        self.root_dir = root_dir
+        self.clip_length = clip_length
+    
+    def __len__(self):
+        return len(os.listdir(self.root_dir))
+    
+    def __getitem__(self, idx):
+        scene_path = os.path.join(self.root_dir, f"{idx}.pt")
+        data = torch.load(scene_path)
+        images, viewpoints = data.frames, data.cameras
+        
+        if self.clip_length:
+            start = random.randint(0, len(images)-self.clip_length)
+            stop = start + self.clip_length
+            images, viewpoints = images[start:stop], viewpoints[start:stop]
+            
+        return images, viewpoints
 
 def sample_batch(x_data, v_data, D, M=None, test=False, seed=None):
     random.seed(seed)

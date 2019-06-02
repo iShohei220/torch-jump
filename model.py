@@ -3,789 +3,254 @@ import random
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.distributions import Normal, Uniform
+# from torch.distributions import Normal, Uniform
+from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
-from representation import Pyramid, Tower, Pool
-from core import PriorCore, InferenceCore, GenerationCore, InferenceCoreGQN, GenerationCoreGQN
-from dataset import sample_batch
-    
-class NSG(nn.Module):
-    def __init__(self, L=12, shared_core=True, z_dim=3, v_dim=5):
-        super(NSG, self).__init__()
-        
-        # Number of generative layers
-        self.L = L
-        
-        self.z_dim = z_dim
-                
-        # Representation network
-        self.phi = Tower(v_dim=v_dim)
-            
-        # Generation network
-        self.shared_core = shared_core
-        if shared_core:
-            self.prior_core = PriorCore(z_dim=z_dim)
-            self.inference_core = InferenceCore(z_dim=z_dim)
-            self.generation_core = GenerationCore(z_dim=z_dim, v_dim=v_dim)
-        else:
-            self.prior_core = nn.ModuleList([PriorCore(z_dim=z_dim) for _ in range(L)])
-            self.inference_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
-            self.generation_core = nn.ModuleList([GenerationCore(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
-            
-        self.eta_pi = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
-        self.eta_e = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
-        self.eta_g = nn.Conv2d(128, 3, kernel_size=1, stride=1, padding=0)
-        
-        self.sigma = Variance([3, 64, 64])
+# from representation import Pyramid, Tower, Pool
+# from core import PriorCore, InferenceCore, GenerationCore, InferenceCoreGQN, GenerationCoreGQN
+# from dataset import sample_batch
 
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(7+3, 8, kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(8, 16, kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+        )
+
+    def forward(self, v, f):
+        B, M, C, H, W = f.size()
+        f = f.contiguous().view(B*M, C, H, W)
+        v = v.contiguous().view(B*M, v.size(2), 1, 1).repeat(1, 1, H, W)
+        r = self.net(torch.cat((v, f), dim=1))
+        
+        return r
+    
+class Conv2dLSTMCell(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(Conv2dLSTMCell, self).__init__()
+
+        kwargs = dict(kernel_size=kernel_size, stride=stride, padding=padding)
+        
+        in_channels += out_channels
+        
+        self.forget = nn.Conv2d(in_channels, out_channels, **kwargs)
+        self.input  = nn.Conv2d(in_channels, out_channels, **kwargs)
+        self.output = nn.Conv2d(in_channels, out_channels, **kwargs)
+        self.state  = nn.Conv2d(in_channels, out_channels, **kwargs)
+
+    def forward(self, input, states):
+        (hidden, cell) = states
+        input = torch.cat((hidden, input), dim=1)
+        
+        forget_gate = torch.sigmoid(self.forget(input))
+        input_gate  = torch.sigmoid(self.input(input))
+        output_gate = torch.sigmoid(self.output(input))
+        state_gate  = torch.tanh(self.state(input))
+
+        # Update internal cell state
+        cell = forget_gate * cell + input_gate * state_gate
+        hidden = output_gate * torch.tanh(cell)
+
+        return hidden, cell
+    
+class Prior(nn.Module):
+    def __init__(self, stride_to_hidden, nf_to_hidden, nf_enc, nf_z):
+        super(Prior, self).__init__()
+        self.conv1 = nn.Conv2d(32, nf_enc, kernel_size=stride_to_hidden, stride=stride_to_hidden)
+        self.lstm = Conv2dLSTMCell(nf_z, nf_to_hidden, kernel_size=5, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(nf_to_hidden, 2*nf_z, kernel_size=5, stride=1, padding=2)
+        
+    def forward(self, r, z, h, c):
+        r = self.conv1(r)
+        h, c = self.lstm(torch.cat((r, z), dim=1), (h, c))
+        mu, logvar = torch.split(self.conv2(h), z.size(1), dim=1)
+        std = torch.exp(0.5*logvar)
+        p = Normal(mu, std)
+        
+        return h, c, p
+
+class Posterior(nn.Module):
+    def __init__(self, stride_to_hidden, nf_to_hidden, nf_enc, nf_z):
+        super(Posterior, self).__init__()
+        self.conv1 = nn.Conv2d(2*32, nf_enc, kernel_size=stride_to_hidden, stride=stride_to_hidden)
+        self.lstm = Conv2dLSTMCell(nf_z, nf_to_hidden, kernel_size=5, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(nf_to_hidden, 2*nf_z, kernel_size=5, stride=1, padding=2)
+        
+    def forward(self, r, r_prime, h, c):
+        lstm_input = self.conv1(torch.cat((r, r_prime), dim=1), (h, c))
+        h, c = self.lstm(torch.cat((lstm_input, z), dim=1), (h, c))
+        mu, logvar = torch.split(self.conv2(h), z.size(1), dim=1)
+        std = torch.exp(0.5*logvar)
+        p = Normal(mu, std)
+        
+        return h, c, p
+    
+class Renderer(nn.Module):
+    def __init__(self, nf_to_hidden, stride_to_obs, nf_to_obs, nf_dec, nf_z, nf_v):
+        super(Renderer, self).__init__()
+        self.conv = nn.Conv(nf_to_obs, nf_dec, kernel_size=stride_to_obs, stride=stride_to_obs)
+        self.lstm = Conv2dLSTMCell(nf_z+nf_v+nf_dec, nf_to_hidden, kernel_size=5, stride=1, padding=2)
+        self.transconv = nn.ConvTranspose2d(nf_to_hidden, nf_to_obs, kernel_size=stride_to_obs, stride=stride_to_obs)
+        
+    def forward(self, z, v, canvas, h, c):
+        K = v.size(1)
+        z = z.view(-1, 1, z.size(1), z.size(2), z.size(3)).repeat(1, v.size(1), 1, 1, 1).view(-1, z.size(1), z.size(2), z.size(3))
+        v = v.view(-1, v.size(2), 1, 1).repeat(1, 1, z.size(2), z.size(3))
+        h, c = self.core(torch.cat((z, v, self.conv(canvas)), dim=1), (h, c))
+        canvas = canvas + self.transconv(h)
+        
+        return h, c, canvas
+
+class JUMP(nn.Module):
+    def __init__(self, nt=4, stride_to_hidden=2, nf_to_hidden=64, nf_enc=128, stride_to_obs=2, nf_to_obs=128, nf_dec=64, nf_z=3, nf_v=1):
+        super(JUMP, self).__init__()
+        
+        # The number of DRAW steps in the network.
+        self.nt = nt
+        # The kernel and stride size of the conv. layer mapping the input image to the LSTM input.
+        self.stride_to_hidden = stride_to_hidden
+        # The number of channels in the LSTM layer.
+        self.nf_to_hidden = nf_to_hidden
+        # The number of channels in the conv. layer mapping the input image to the LSTM input.
+        self.nf_enc = nf_enc
+        # The kernel and stride size of the transposed conv. layer mapping the LSTM state to the canvas.
+        self.stride_to_obs = stride_to_obs
+        # The number of channels in the hidden layer between LSTM states and the canvas
+        self.nf_to_obs = nf_to_obs
+        # The number of channels of the conv. layer mapping the canvas state to the LSTM input.
+        self.nf_dec = nf_dec
+        # The number of channels in the stochastic latent in each DRAW step.
+        self.nf_z = nf_z
+                
+        # Encoder network
+        self.m_theta = Encoder()
+            
+        # DRAW
+        self.prior = Prior(stride_to_hidden, nf_to_hidden, nf_enc, nf_z)
+        self.posterior = Posterior(stride_to_hidden, nf_to_hidden, nf_enc, nf_z)
+        
+        # Renderer
+        self.m_gamma = Renderer(nf_to_hidden, stride_to_obs, nf_to_obs, nf_dec, nf_z, nf_v)
+        self.transconv = nn.ConvTranspose2d(nf_to_obs, 3, kernel_size=4, stride=4)
+        
     # EstimateELBO
-    def forward(self, x, v):
-        B, M, *_ = v.size()
+    def forward(self, v_data, f_data, pixel_var):
+        B, N, C, H, W = f_data.size()
         
-        # Add noise to image
-        noise_range = x.new_ones(x.size()) / (2*255)
-        x = x + Uniform(-noise_range, noise_range).sample()
+        M = random.randint(1, N-1)
+        indices = np.random.permutation(range(N))
+        context_idx, target_idx = indices[:M], indices[M:]
+        v, f = v_data[:, context_idx], f_data[:, context_idx]
+        v_prime, f_prime = v_data[:, target_idx], f_data[:, target_idx]
         
-        # Scene encoder
-#         r = torch.sum(self.phi(x.view(-1, 3, 64, 64), v.view(-1, 7)).view(B, -1, 256, 16, 16), dim=1)
-        r = self.phi(x, v)
+        r = torch.sum(self.m_theta(v, f).view(B, M, 32, H//4, W//4), dim=1)
+        r_prime = torch.sum(self.m_theta(v_prime, f_prime).view(B, N-M, 32, H//4, W//4), dim=1)
+        
+        H_hidden, W_hidden = H//(4*self.stride_to_hidden), W//(4*self.stride_to_hidden)
 
         # Prior initial state
-        c_pi = x.new_zeros((B, 128, 16, 16))
-        h_pi = x.new_zeros((B, 128, 16, 16))
-        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
+        h_phi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
+        c_phi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
         
-        # Inference initial state
-#         c_e = x.new_zeros((B, 128, 16, 16))
-#         h_e = x.new_zeros((B, 128, 16, 16))
-#         z_e = x.new_zeros((B, self.z_dim, 16, 16))
-        c_e = x.new_zeros((B*M, 128, 16, 16))
-        h_e = x.new_zeros((B*M, 128, 16, 16))
-        z_e = x.new_zeros((B*M, self.z_dim, 16, 16))
+        # Posterior initial state
+        h_psi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
+        c_psi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
+        z = v.new_zeros((B, self.nf_z, H_hidden, W_hidden))
         
-        # Generator initial state
-        c_g = x.new_zeros((B*M, 128, 16, 16))
-        h_g = x.new_zeros((B*M, 128, 16, 16))
-        u = x.new_zeros((B*M, 128, 64, 64))
+        # Renderer initial state
+        h_gamma = v.new_zeros((B*(N-M), self.nf_to_hidden, H_hidden, W_hidden))
+        c_gamma = v.new_zeros((B*(N-M), self.nf_to_hidden, H_hidden, W_hidden))
+        canvas = v.new_zeros((B*(N-M), self.nf_to_obs, H_hidden*self.stride_to_obs, W_hidden*self.stride_to_obs))
         
         kl = 0
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
-            else:
-                c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
-                
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
+        for t in range(self.nt):
+            # Prior
+            h_phi, c_phi, p_phi  = self.prior(r, z, h_phi, c_phi)
             
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(z_e, r, c_e, h_e)
-            else:
-                c_e, h_e = self.inference_core[l](z_e, r, c_e, h_e)
-            
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q.view(B, M, self.z_dim, 16, 16), std_q.view(B, M, self.z_dim, 16, 16))
-            q_poe = self.poe(pi, q)
-            
+            # Posterior
+            h_psi, c_psi, p_psi  = self.posterior(r, r_prime, z, h_psi, c_psi)
+
             # Posterior sample
-            z_e = q.rsample().view(-1, self.z_dim, 16, 16)
-            z_poe = q_poe.rsample()
+            z = p_psi.rsample()
             
             # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, c_g, h_g, u, z_poe)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, c_g, h_g, u, z_poe)
+            h_gamma, c_gamma, canvas = self.m_gamma(z, v_prime, canvas, h_gamma, c_gamma)
                 
             # ELBO KL contribution update
-            kl += torch.sum(kl_divergence(q_poe, pi), dim=[1,2,3])
+            kl += torch.sum(kl_divergence(p_psi, p_phi), dim=[1,2,3])
                 
-        # ELBO likelihood contribution update
-#         sigma = self.sigma.view(1, 1, 3, 64, 64).repeat(B, K, 1, 1, 1)
-        nll = - torch.sum(Normal(self.eta_g(u).view(B, M, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4])
-        elbo = nll + kl
-
-        return elbo, nll, kl
+        # Sample frame
+        f_hat = self.transconv(canvas).view(B, N-M, C, H, W) + Normal(v.zeros_like(), torch.sqrt(pixel_var)).sample()
+        mse_loss = nn.MSELoss(reduction='none')
+        mse = torch.sum(mse_loss(f_hat, f_prime), dim=[1,2,3,4])
+        elbo = kl + mse / pixel_var
+        
+        return elbo, kl, mse
     
-    def generate(self, v):
-        B, K, *_ = v.size()
+    def generate(self, v, f, v_prime):
+        B, M, C, H, W = f.size()
+        N = v_prime.size(1)
+        
+        # Scene encoder
+        r = torch.sum(self.m_theta(v, f).view(B, M, 32, H//4, W//4), dim=1)
+        
+        H_hidden, W_hidden = H//(4*self.stride_to_hidden), W//(4*self.stride_to_hidden)
 
         # Prior initial state
-        c_pi = v.new_zeros((B, 128, 16, 16))
-        h_pi = v.new_zeros((B, 128, 16, 16))
-        z_pi = v.new_zeros((B, self.z_dim, 16, 16))
+        h_phi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
+        c_phi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
         
-        # Generator initial state
-        c_g = v.new_zeros((B*K, 128, 16, 16))
-        h_g = v.new_zeros((B*K, 128, 16, 16))
-        u = v.new_zeros((B*K, 128, 64, 64))
+        z = v.new_zeros((B, self.nf_z, H_hidden, W_hidden))
+        
+        # Renderer initial state
+        h_gamma = v.new_zeros((B*N, self.nf_to_hidden, H_hidden, W_hidden))
+        c_gamma = v.new_zeros((B*N, self.nf_to_hidden, H_hidden, W_hidden))
+        canvas = v.new_zeros((B*N, self.nf_to_obs, H_hidden*self.stride_to_obs, W_hidden*self.stride_to_obs))
                 
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_pi, c_pi, h_pi)
-            else:
-                c_pi, h_pi = self.prior_core[l](z_pi, c_pi, h_pi)
-                
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
-            
-            # Prior Sample
-            z_pi = pi.sample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, c_g, h_g, u, z_pi)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, c_g, h_g, u, z_pi)
-                
-        # Image sample
-        mu = self.eta_g(u).view(B, K, 3, 64, 64)
+        for t in range(self.nt):
+            # Prior
+            h_phi, c_phi, p_phi  = self.prior(r, z, h_phi, c_phi)
 
-        return torch.clamp(mu, 0, 1)
-    
-    def predict(self, x, v, v_q):
-        B, M, *_ = x.size()
-        K = v_q.size(1)
-        
-        # Scene encoder
-#         r = torch.sum(self.phi(x.view(-1, 3, 64, 64), v.view(-1, 7)).view(B, M, 256, 16, 16), dim=1)
-        r = self.phi(x, v)
-        
-        # Prior initial state
-        c_pi = x.new_zeros((B, 128, 16, 16))
-        h_pi = x.new_zeros((B, 128, 16, 16))
-        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Inference initial state
-#         c_e = x.new_zeros((B, 128, 16, 16))
-#         h_e = x.new_zeros((B, 128, 16, 16))
-#         z_e = x.new_zeros((B, self.z_dim, 16, 16))
-        c_e = x.new_zeros((B*M, 128, 16, 16))
-        h_e = x.new_zeros((B*M, 128, 16, 16))
-        z_e = x.new_zeros((B*M, self.z_dim, 16, 16))
-        
-        # Generator initial state
-        c_g = x.new_zeros((B*K, 128, 16, 16))
-        h_g = x.new_zeros((B*K, 128, 16, 16))
-        u = x.new_zeros((B*K, 128, 64, 64))
-                
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
-            else:
-                c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
-                
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
-            
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(z_e, r, c_e, h_e)
-            else:
-                c_e, h_e = self.inference_core[l](z_e, r, c_e, h_e)
-            
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q.view(B, M, self.z_dim, 16, 16), std_q.view(B, M, self.z_dim, 16, 16))
-            q_poe = self.poe(pi, q)
-            
-            # Posterior sample
-            z_e = q.rsample().view(-1, self.z_dim, 16, 16)
-            z_poe = q_poe.sample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_q, c_g, h_g, u, z_poe)
-            else:
-                c_g, h_g, u = self.generation_core[l](v_q, c_g, h_g, u, z_poe)
-                
-        # Image sample
-        mu = self.eta_g(u).view(B, K, 3, 64, 64)
-
-        return torch.clamp(mu, 0, 1)
-    
-    def reconstruct(self, x, v):
-        B, M, *_ = x.size()
-        
-        # Scene encoder
-#         r = torch.sum(self.phi(x.view(-1, 3, 64, 64), v.view(-1, 7)).view(B, -1, 256, 16, 16), dim=1)
-        r = self.phi(x, v)
-        
-        # Prior initial state
-        c_pi = x.new_zeros((B, 128, 16, 16))
-        h_pi = x.new_zeros((B, 128, 16, 16))
-        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Inference initial state
-#         c_e = x.new_zeros((B, 128, 16, 16))
-#         h_e = x.new_zeros((B, 128, 16, 16))
-#         z_e = x.new_zeros((B, self.z_dim, 16, 16))
-        c_e = x.new_zeros((B*M, 128, 16, 16))
-        h_e = x.new_zeros((B*M, 128, 16, 16))
-        z_e = x.new_zeros((B*M, self.z_dim, 16, 16))
-        
-        # Generator initial state
-        c_g = x.new_zeros((B*M, 128, 16, 16))
-        h_g = x.new_zeros((B*M, 128, 16, 16))
-        u = x.new_zeros((B*M, 128, 64, 64))
-        
-        kl = 0
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
-            else:
-                c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
-                
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
-            
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(z_e, r, c_e, h_e)
-            else:
-                c_e, h_e = self.inference_core[l](z_e, r, c_e, h_e)
-            
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q.view(B, M, self.z_dim, 16, 16), std_q.view(B, M, self.z_dim, 16, 16))
-            q_poe = self.poe(pi, q)
-            
-            # Posterior sample
-            z_e = q.rsample().view(-1, self.z_dim, 16, 16)
-            z_poe = q_poe.sample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, c_g, h_g, u, z_poe)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, c_g, h_g, u, z_poe)
-                
-        # Image sample
-        mu = self.eta_g(u).view(B, M, 3, 64, 64)
-
-        return torch.clamp(mu, 0, 1)
-    
-    def inference(self, x, v):
-        B, M, *_ = x.size()
-        
-        # Scene encoder
-#         r = torch.sum(self.phi(x.view(-1, 3, 64, 64), v.view(-1, 7)).view(B, -1, 256, 16, 16), dim=1)
-        r = self.phi(x, v)
-        
-        # Prior initial state
-        c_pi = x.new_zeros((B, 128, 16, 16))
-        h_pi = x.new_zeros((B, 128, 16, 16))
-        z_poe = x.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Inference initial state
-#         c_e = x.new_zeros((B, 128, 16, 16))
-#         h_e = x.new_zeros((B, 128, 16, 16))
-#         z_e = x.new_zeros((B, self.z_dim, 16, 16))
-        c_e = x.new_zeros((B*M, 128, 16, 16))
-        h_e = x.new_zeros((B*M, 128, 16, 16))
-        z_e = x.new_zeros((B*M, self.z_dim, 16, 16))
-        
-        # Prior state update
-        if self.shared_core:
-            c_pi, h_pi = self.prior_core(z_poe, c_pi, h_pi)
-        else:
-            c_pi, h_pi = self.prior_core[l](z_poe, c_pi, h_pi)
-                
-        # Prior factor
-        mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-        std_pi = torch.exp(0.5*logvar_pi)
-        pi = Normal(mu_pi, std_pi)
-            
-        # Inference state update
-        if self.shared_core:
-            c_e, h_e = self.inference_core(z_e, r, c_e, h_e)
-        else:
-            c_e, h_e = self.inference_core[l](z_e, r, c_e, h_e)
-        
-        # Posterior factor
-        mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-        std_q = torch.exp(0.5*logvar_q)
-        q = Normal(mu_q.view(B, M, self.z_dim, 16, 16), std_q.view(B, M, self.z_dim, 16, 16))
-        q_poe = self.poe(pi, q)
-            
-        # Posterior sample
-        z_poe = q_poe.sample()
-        
-        return z_poe
-    
-    def poe(self, prior, posterior, eps=1e-8):
-        vars = torch.cat((prior.variance.view(-1,1,self.z_dim,16,16), posterior.variance), dim=1) + eps
-        var = 1. / torch.sum(torch.reciprocal(vars), dim=1) + eps
-        locs = torch.cat((prior.loc.view(-1,1,self.z_dim,16,16), posterior.loc), dim=1)
-        loc = torch.sum(locs/vars, dim=1) * var
-        return Normal(loc, torch.sqrt(var))
-    
-class CGQN(nn.Module):
-    def __init__(self, L=12, shared_core=True, z_dim=3, v_dim=5):
-        super(CGQN, self).__init__()
-        
-        # Number of generative layers
-        self.L = L
-        
-        self.z_dim = z_dim
-        self.v_dim = v_dim
-                
-        # Representation network
-        self.phi = Tower(v_dim=v_dim)
-            
-        # Generation network
-        self.shared_core = shared_core
-        if shared_core:
-            self.prior_core = InferenceCore(z_dim=z_dim)
-            self.inference_core = InferenceCore(z_dim=z_dim)
-            self.generation_core = GenerationCore(z_dim=z_dim, v_dim=v_dim)
-        else:
-            self.prior_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
-            self.inference_core = nn.ModuleList([InferenceCore(z_dim=z_dim) for _ in range(L)])
-            self.generation_core = nn.ModuleList([GenerationCore(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
-            
-        self.eta_pi = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
-        self.eta_e = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
-        self.eta_g = nn.Conv2d(128, 3, kernel_size=1, stride=1, padding=0)
-        
-        self.sigma = Variance([3, 64, 64])
-
-    # EstimateELBO
-    def forward(self, x, v, train):
-        B, M, *_ = v.size()
-        
-        # Add noise to image
-        noise_range = x.new_ones(x.size()) / (2*255)
-        x = x + Uniform(-noise_range, noise_range).sample()
-        
-        if train:
-            K = random.randint(1, M-1)
-            indices = np.random.permutation(range(M))
-            context_idx, target_idx = indices[:K], indices[K:]
-            x_t, v_t = x[:, target_idx], v[:, target_idx]
-            x_c, v_c = x[:, context_idx], v[:, context_idx]
-            r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
-        else:
-            x_t, v_t = x, v
-            r = x.new_zeros((B, 256, 16, 16))
-            
-        T = x_t.size(1)
-        
-        # Scene encoder
-#         if train:
-#             r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
-#         else:
-#             r = x.new_zeros((B, 256, 16, 16))
-            
-        r_T = torch.sum(self.phi(x, v).view(B, -1, 256, 16, 16), dim=1)
-
-        # Prior initial state
-        c_pi = x.new_zeros((B, 128, 16, 16))
-        h_pi = x.new_zeros((B, 128, 16, 16))
-        
-        # Inference initial state
-        c_e = x.new_zeros((B, 128, 16, 16))
-        h_e = x.new_zeros((B, 128, 16, 16))
-        z_e = x.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Generator initial state
-        c_g = x.new_zeros((B*T, 128, 16, 16))
-        h_g = x.new_zeros((B*T, 128, 16, 16))
-        u = x.new_zeros((B*T, 128, 64, 64))
-        
-        kl = 0
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_e, r, c_pi, h_pi)
-
-            else:
-                c_pi, h_pi = self.prior_core[l](z_e, r, c_pi, h_pi)
-                
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
-            
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(z_e, r_T, c_e, h_e)
-            else:
-                c_e, h_e = self.inference_core[l](z_e, r_T, c_e, h_e)
-            
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q, std_q)
-            
-            # Posterior sample
-            z_e = q.rsample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_t, c_g, h_g, u, z_e)
-            else:
-                c_g, h_g, u = self.generation_core[l](v_t, c_g, h_g, u, z_e)
-                
-            # ELBO KL contribution update
-            kl += torch.sum(kl_divergence(q, pi), dim=[1,2,3])
-                
-        # ELBO likelihood contribution update
-#         nll = - torch.sum(Normal(self.eta_g(u).view(B, -1, 3, 64, 64), self.sigma()).log_prob(x), dim=[1,2,3,4])
-        nll = - torch.sum(Normal(self.eta_g(u).view(B, -1, 3, 64, 64), self.sigma()).log_prob(x_t), dim=[1,2,3,4])
-
-        elbo = nll + kl
-
-        return elbo, nll, kl
-    
-    def generate(self, v):
-        B, K, *_ = v.size()
-        
-        r = v.new_zeros((B, 256, 16, 16))
-
-        # Prior initial state
-        c_pi = v.new_zeros((B, 128, 16, 16))
-        h_pi = v.new_zeros((B, 128, 16, 16))
-        z_pi = v.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Generator initial state
-        c_g = v.new_zeros((B*K, 128, 16, 16))
-        h_g = v.new_zeros((B*K, 128, 16, 16))
-        u = v.new_zeros((B*K, 128, 64, 64))
-                
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_pi, r, c_pi, h_pi)
-            else:
-                c_pi, h_pi = self.prior_core[l](z_pi, r, c_pi, h_pi)
-                
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi, std_pi)
-            
-            # Prior Sample
-            z_pi = pi.sample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, c_g, h_g, u, z_pi)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, c_g, h_g, u, z_pi)
-                
-        # Image sample
-        mu = self.eta_g(u).view(B, K, 3, 64, 64)
-
-        return torch.clamp(mu, 0, 1)
-    
-    def predict(self, x_c, v_c, v_t):
-        B, M, *_ = x_c.size()
-        K = v_t.size(1)
-        
-        # Scene encoder
-        r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
-        
-        # Inference initial state
-        c_e = x_c.new_zeros((B, 128, 16, 16))
-        h_e = x_c.new_zeros((B, 128, 16, 16))
-        z_e = x_c.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Generator initial state
-        c_g = x_c.new_zeros((B*K, 128, 16, 16))
-        h_g = x_c.new_zeros((B*K, 128, 16, 16))
-        u = x_c.new_zeros((B*K, 128, 64, 64))
-                
-        for l in range(self.L):
-            # Prior state update
-            if self.shared_core:
-                c_pi, h_pi = self.prior_core(z_e, r, c_e, h_e)
-            else:
-                c_pi, h_pi = self.prior_core[l](z_e, r, c_e, h_e)
-            
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_pi), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            p = Normal(mu_pi, std_pi)
-            
-            # Posterior sample
-            z_e = p.rsample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_t, c_g, h_g, u, z_e)
-            else:
-                c_g, h_g, u = self.generation_core[l](v_t, c_g, h_g, u, z_e)
-                
-        # Image sample
-        mu = self.eta_g(u).view(B, K, 3, 64, 64)
-
-        return torch.clamp(mu, 0, 1)
-    
-    def reconstruct(self, x, v):
-        B, M, *_ = x.size()
-        
-        # Scene encoder
-        r = torch.sum(self.phi(x, v).view(B, -1, 256, 16, 16), dim=1)
-        
-        # Inference initial state
-        c_e = x.new_zeros((B, 128, 16, 16))
-        h_e = x.new_zeros((B, 128, 16, 16))
-        z_e = x.new_zeros((B, self.z_dim, 16, 16))
-        
-        # Generator initial state
-        c_g = x.new_zeros((B*M, 128, 16, 16))
-        h_g = x.new_zeros((B*M, 128, 16, 16))
-        u = x.new_zeros((B*M, 128, 64, 64))
-        
-        for l in range(self.L):
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(z_e, r, c_e, h_e)
-            else:
-                c_e, h_e = self.inference_core[l](z_e, r, c_e, h_e)
-            
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q, std_q)
-            
-            # Posterior sample
-            z_e = q.sample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, c_g, h_g, u, z_e)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, c_g, h_g, u, z_e)
-                
-        # Image sample
-        mu = self.eta_g(u).view(B, M, 3, 64, 64)
-
-        return torch.clamp(mu, 0, 1)
-    
-class GQN(nn.Module):
-    def __init__(self, L=12, shared_core=True, z_dim=3, v_dim=5):
-        super(GQN, self).__init__()
-        
-        self.z_dim = z_dim
-        self.v_dim = v_dim
-        
-        # Number of generative layers
-        self.L = L
-                
-        # Representation network
-        self.phi = Tower(v_dim=v_dim)
-            
-        # Generation network
-        self.shared_core = shared_core
-        if shared_core:
-            self.inference_core = InferenceCoreGQN(z_dim=z_dim, v_dim=v_dim)
-            self.generation_core = GenerationCoreGQN(z_dim=z_dim, v_dim=v_dim)
-        else:
-            self.inference_core = nn.ModuleList([InferenceCoreGQN(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
-            self.generation_core = nn.ModuleList([GenerationCoreGQN(z_dim=z_dim, v_dim=v_dim) for _ in range(L)])
-            
-        self.eta_e = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
-        self.eta_pi = nn.Conv2d(128, 2*z_dim, kernel_size=5, stride=1, padding=2)
-        self.eta_g = nn.Conv2d(128, 3, kernel_size=1, stride=1, padding=0)
-        
-        self.sigma = Variance([3, 64, 64])
-
-    # EstimateELBO
-    def forward(self, x, v, sigma, train):
-        B, M, *_ = v.size()
-        
-        # Add noise to image
-        noise_range = x.new_ones(x.size()) / (2*255)
-        x = x + Uniform(-noise_range, noise_range).sample()
-        
-#         K = random.randint(1, M-1)
-#         indices = np.random.permutation(range(M))
-#         context_idx, target_idx = indices[:K], indices[K]
-# #         context_idx = random.sample(range(M), K)
-#         x_c, v_c = x[:, context_idx], v[:, context_idx]
-        if train:
-            K = random.randint(1, M-1)
-            indices = np.random.permutation(range(M))
-            context_idx, target_idx = indices[:K], indices[K]
-            x_t, v_t = x[:, target_idx], v[:, target_idx]
-            T = 1
-            x_c, v_c = x[:, context_idx], v[:, context_idx]
-            r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
-        else:
-            r = x.new_zeros((B, 256, 16, 16))
-            x_t, v_t = x, v
-            T = M
-        
-#         # Scene encoder
-#         if train:
-#             r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
-#         else:
-#             r = x.new_zeros((B, 256, 16, 16))
-                        
-        # Inference initial state
-        c_e = x.new_zeros((B*T, 128, 16, 16))
-        h_e = x.new_zeros((B*T, 128, 16, 16))
-                        
-        # Generator initial state
-        c_g = x.new_zeros((B*T, 128, 16, 16))
-        h_g = x.new_zeros((B*T, 128, 16, 16))
-        u = x.new_zeros((B*T, 128, 64, 64))
-                
-        kl = 0
-        for l in range(self.L):
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
-            
-            # Inference state update
-            if self.shared_core:
-                c_e, h_e = self.inference_core(x_t, v_t, r, c_e, h_e, h_g, u)
-            else:
-                c_e, h_e = self.inference_core[l](x_t, v_t, r, c_e, h_e, h_g, u)
-            
-            # Posterior factor
-            mu_q, logvar_q = torch.split(self.eta_e(h_e), self.z_dim, dim=1)
-            std_q = torch.exp(0.5*logvar_q)
-            q = Normal(mu_q.view(B, -1, self.z_dim, 16, 16), std_q.view(B, -1, self.z_dim, 16, 16))
-            
-            # Posterior sample
-            z = q.rsample()
-            
-            # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_t, r, c_g, h_g, u, z)
-            else:
-                c_g, h_g, u = self.generation_core[l](v_t, r, c_g, h_g, u, z)
-                
-            # KL contribution update
-            kl += torch.sum(kl_divergence(q, pi), dim=[1,2,3,4])
-                
-        # likelihood contribution update
-#         nll = - torch.sum(Normal(self.eta_g(u).view(B, -1, 3, 64, 64), self.sigma()).log_prob(x.view(B, -1, 3, 64, 64)), dim=[1,2,3,4])
-        nll = - torch.sum(Normal(self.eta_g(u).view(B, -1, 3, 64, 64), sigma).log_prob(x.view(B, -1, 3, 64, 64)), dim=[1,2,3,4])
-        elbo = nll + kl
-
-        return elbo, nll, kl
-    
-    def generate(self, v):
-        B, M, *_ = v.size()
-
-        # Scene encoder
-        r = v.new_zeros((B, 256, 16, 16))
-        
-        # Generator initial state
-        c_g = v.new_zeros((B*M, 128, 16, 16))
-        h_g = v.new_zeros((B*M, 128, 16, 16))
-        u = v.new_zeros((B*M, 128, 64, 64))
-                
-        for l in range(self.L):
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
-            
             # Prior sample
-            z = pi.sample()
+            z = p_psi.sample()
             
             # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, r, c_g, h_g, u, z)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, r, c_g, h_g, u, z)
+            h_gamma, c_gamma, canvas = self.m_gamma(z, v_prime, canvas, h_gamma, c_gamma)
                 
-        mu = self.eta_g(u).view(B, M, 3, 64, 64)
+        # Sample frame
+        f_hat = self.transconv(canvas).view(B, N, C, H, W)
 
-        return torch.clamp(mu, 0, 1)
+        return torch.clamp(f_hat, 0, 1)
     
-    def predict(self, x_c, v_c, v_q):
-        B, M, *_ = x_c.size()
-        K = v_q.size(1)
+    def reconstruct(self, v, f):
+        B, N, C, H, W = f.size()
         
         # Scene encoder
-        r = torch.sum(self.phi(x_c, v_c).view(B, -1, 256, 16, 16), dim=1)
-
-        # Initial state
-        c_g = x_c.new_zeros((B*K, 128, 16, 16))
-        h_g = x_c.new_zeros((B*K, 128, 16, 16))
-        u = x_c.new_zeros((B*K, 128, 64, 64))
+        r = torch.sum(self.m_theta(v, f).view(B, N, 32, H//4, W//4), dim=1)
         
-        for l in range(self.L):
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
-            
-            # Prior sample
-            z = pi.sample()
-            
-            # State update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v_q, r, c_g, h_g, u, z)
-            else:
-                c_g, h_g, u = self.generation_core[l](v_q, r, c_g, h_g, u, z)
-            
-        # Image sample
-        mu = self.eta_g(u).view(B, K, 3, 64, 64)
-
-        return torch.clamp(mu, 0, 1)
-    
-    def reconstruct(self, x, v):
-        B, M, *_ = x.size()
-
-        # Scene encoder
-        r = torch.sum(self.phi(x, v).view(B, -1, 256, 16, 16), dim=1)
+        # Posterior initial state
+        h_psi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
+        c_psi = v.new_zeros((B, self.nf_to_hidden, H_hidden, W_hidden))
+        z = v.new_zeros((B, self.nf_z, H_hidden, W_hidden))
         
-        # Generator initial state
-        c_g = x.new_zeros((B*M, 128, 16, 16))
-        h_g = x.new_zeros((B*M, 128, 16, 16))
-        u = x.new_zeros((B*M, 128, 64, 64))
-                
-        for l in range(self.L):
-            # Prior factor
-            mu_pi, logvar_pi = torch.split(self.eta_pi(h_g), self.z_dim, dim=1)
-            std_pi = torch.exp(0.5*logvar_pi)
-            pi = Normal(mu_pi.view(B, -1, self.z_dim, 16, 16), std_pi.view(B, -1, self.z_dim, 16, 16))
-            
+        for t in range(self.nt):
+            # Prior
+            h_phi, c_phi, p_phi  = self.prior(r, z, h_phi, c_phi)
+
             # Prior sample
-            z = pi.sample()
+            z = p_phi.sample()
             
             # Generator state update
-            if self.shared_core:
-                c_g, h_g, u = self.generation_core(v, r, c_g, h_g, u, z)
-            else:
-                c_g, h_g, u = self.generation_core[l](v, r, c_g, h_g, u, z)
+            h_gamma, c_gamma, canvas = self.m_gamma(z, v, canvas, h_gamma, c_gamma)
                 
-        mu = self.eta_g(u).view(B, M, 3, 64, 64)
+        # Sample frame
+        f_hat = self.transconv(canvas).view(B, N, C, H, W)
 
-        return torch.clamp(mu, 0, 1)
+        return torch.clamp(f_hat, 0, 1)
     
-class Variance(nn.Module):
-    def __init__(self, size, eps=1e-8):
-        super(Variance, self).__init__()
-        self.param = nn.Parameter(torch.Tensor(*size))
-        nn.init.constant_(self.param, 0)
-        self.eps = eps
-        
-    def forward(self):
-        sigma = torch.sqrt(torch.exp(self.param) + self.eps)
-        return sigma

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
 from dataset import GQNDataset, SceneNet, Scene, transform_viewpoint, sample_batch
 from scheduler import AnnealingStepLR
-from model import NSG, GQN, CGQN
+from model import JUMP
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
@@ -38,8 +38,6 @@ if __name__ == '__main__':
     parser.add_argument('--M', type=int, help='M in test', default=5)
     parser.add_argument('--num_epoch', type=int, help='number of epochs', default=20)
     parser.add_argument('--seed', type=int, help='random seed (default: None)', default=None)
-    parser.add_argument('--model', type=str, help='which model to use (default: NSG)', default='NSG')
-    args = parser.parse_args()
 
     device = f"cuda:{args.device_ids[0]}" if torch.cuda.is_available() else "cpu"
     
@@ -82,65 +80,60 @@ if __name__ == '__main__':
     
     M = args.M
     
-    # Number of generative layers
-    L =args.layers
-
+    # Hyperparameters
+    if D=='Narratives':
+        nt=4, stride_to_hidden=2, nf_to_hidden=64, nf_enc=128, stride_to_obs=2, nf_to_obs=128, nf_dec=64, nf_z=3, nf_v=1, alpha=2.0, beta=0.5
+#     elif D=='MNISTDice':
+    else:
+        nt=6, stride_to_hidden=2, nf_to_hidden=128, nf_enc=128, stride_to_obs=2, nf_to_obs=128, nf_dec=128, nf_z=3, nf_v=5
+#     else:
+#         raise NotImplementedError
+        
     # Maximum number of training steps
     S_max = args.gradient_steps
 
     # Define model
-    if args.model=='NSG':
-        model = NSG(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
-    elif args.model=='GQN':
-        model = GQN(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
-    elif args.model=='CGQN':
-        model = CGQN(L=L, shared_core=args.shared_core, z_dim=args.z_dim, v_dim=args.v_dim).to(device)
+    model = JUMP(nt, stride_to_hidden, nf_to_hidden, nf_enc, stride_to_obs, nf_to_obs, nf_dec, nf_z, nf_v).to(device)
 
     if len(args.device_ids)>1:
         model = nn.DataParallel(model, device_ids=args.device_ids)
-
-#     if args.model == "GQN" or args.model == "CGQN":
-    if args.model == "GQN":
-        # Pixel standard-deviation
-        sigma_i, sigma_f = 2.0, 0.7
-        sigma = sigma_i
         
-        optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
-        scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
+    scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
 
-#     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999), eps=1e-08)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08)
-    
-#     scheduler = AnnealingStepLR(optimizer, mu_i=5e-4, mu_f=5e-5, n=1.6e6)
-    
     kwargs = {'num_workers':num_workers, 'pin_memory': True} if torch.cuda.is_available() else {}
 
     train_loader = DataLoader(train_dataset, batch_size=B, shuffle=True, **kwargs)
     test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, **kwargs)
 
 #     train_iter = iter(train_loader)
-    x_data_test, v_data_test = next(iter(test_loader))
+    f_data_test, v_data_test = next(iter(test_loader))
+    N = f_data_test.size(1)
 
     step = 0
     # Training Iterations
     for epoch in range(args.num_epoch):
-        if len(args.device_ids)>1:
-            model.module.sigma.param.requires_grad = True if epoch>=args.num_epoch//2 else False
-        else:
-            model.sigma.param.requires_grad = True if epoch>=args.num_epoch//2 else False
-            
-        for t, (x_data, v_data) in enumerate(tqdm(train_loader)):
+        for t, (f_data, v_data) in enumerate(tqdm(train_loader)):
             model.train()
-            x, v = sample_batch(x_data, v_data, D)
-            x, v = x.to(device), v.to(device)
-            if args.model == "GQN":
-                train_elbo, train_nll, train_kl = model(x, v, sigma, True)
-            elif args.model == "CGQN":
-                train_elbo, train_nll, train_kl = model(x, v, True)
-            else:
-                train_elbo, train_nll, train_kl = model(x, v)
+            
+            if D=='Narratives':
+                pixel_var = max(beta + (alpha - beta)*(1 - step/(1e5)), beta)
+#             elif D=='MNISTDice':
+            else
+                if step < 1e5:
+                    pixel_var = 2.0
+                elif step < 1.5e5:
+                    pixel_var = 0.2
+                elif step < 2e5:
+                    pixel_var = 0.4
+                else:
+                    pixel_var = 0.9
+#             else:
+#                 raise NotImplementedError
+                
+            f, v = sample_batch(f_data, v_data, D)
+            f, v = f.to(device), v.to(device)
+            train_elbo, train_kl, train_mse = model(v, f, pixel_var)
 
             # Compute empirical ELBO gradients
             train_elbo.mean().backward()
@@ -149,60 +142,39 @@ if __name__ == '__main__':
             optimizer.step()
             optimizer.zero_grad()
             
-#             # Pixel-variance annealing
-#             sigma = max(sigma_f + (sigma_i - sigma_f)*(1 - step/(2e5)), sigma_f)
-            
-#             if args.model == "GQN" or args.model == "CGQN":
-            if args.model == "GQN":
-                # Update optimizer state
-                scheduler.step()
-                # Pixel-variance annealing
-                sigma = max(sigma_f + (sigma_i - sigma_f)*(1 - step/(2e5)), sigma_f)
-            
             # Update optimizer state
-#             scheduler.step()
+            scheduler.step()
 
             # Logs
             writer.add_scalar('train_elbo', train_elbo.mean(), step)
-            writer.add_scalar('train_nll', train_nll.mean(), step)
             writer.add_scalar('train_kl', train_kl.mean(), step)
+            writer.add_scalar('train_mse', train_nll.mean(), step)
 
             with torch.no_grad():
                 model.eval()
                 # Write logs to TensorBoard
                 if step % log_interval_num == 0:
-                    x_test, v_test = sample_batch(x_data_test, v_data_test, D, seed=0)
-                    x_test, v_test = x_test.to(device), v_test.to(device)
+                    f_test, v_test = sample_batch(f_data_test, v_data_test, D, seed=0)
+                    f_test, v_test = f_test.to(device), v_test.to(device)
                     
-                    if args.model == "GQN":
-                        test_elbo, test_nll, test_kl = model(x_test, v_test, sigma, False)
-                    elif args.model == "CGQN":
-                        test_elbo, test_nll, test_kl = model(x_test, v_test, False)  
-                    else:
-                        test_elbo, test_nll, test_kl = model(x_test, v_test)
+                    test_elbo, test_kl, test_mse = model(v_test, f_test, pixel_var)  
 
-#                     random.seed(0)
-#                     context_idx = random.sample(range(x_test.size(1)), M)
-#                     x_context, v_context = x_test[:, context_idx], v_test[:, context_idx]
-                    x_context, v_context = x_test[:, :M], v_test[:, :M]
+                    f_context, v_context = f_test[:, :M], v_test[:, :M]
 
                     if len(args.device_ids)>1:
-                        x_gen = model.module.generate(v_test)
-                        x_pred = model.module.predict(x_context, v_context, v_test)
-                        x_rec = model.module.reconstruct(x_test, v_test)
+                        f_prime = model.module.generate(v_test[:, :M], f_test[:, :M], v_test[:, M:])
+                        f_hat = model.module.reconstruct(v_test, f_test)
                     else:
-                        x_gen = model.generate(v_test)
-                        x_pred = model.predict(x_context, v_context, v_test)
-                        x_rec = model.reconstruct(x_test, v_test)
+                        f_prime = model.generate(v_test[:, :M], f_test[:, :M], v_test[:, M:])
+                        f_hat = model.reconstruct(v_test, f_test)
             
                     writer.add_scalar('test_elbo', test_elbo.mean(), step)
-                    writer.add_scalar('test_nll', test_nll.mean(), step)
                     writer.add_scalar('test_kl', test_kl.mean(), step)
-                    writer.add_image('test_context', make_grid(x_context.contiguous().view(-1, 3, 64, 64), M, pad_value=1), step)
-                    writer.add_image('test_ground_truth', make_grid(x_test.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
-                    writer.add_image('test_prediction', make_grid(x_pred.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
-                    writer.add_image('test_generation', make_grid(x_gen.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
-                    writer.add_image('test_reconstruction', make_grid(x_rec.contiguous().view(-1, 3, 64, 64), 10, pad_value=1), step)
+                    writer.add_scalar('test_mse', test_mse.mean(), step)
+                    writer.add_image('test_context', make_grid(f_context.contiguous().view(-1, 3, 64, 64), M, pad_value=1), step)
+                    writer.add_image('test_ground_truth', make_grid(f_test.contiguous().view(-1, 3, 64, 64), N, pad_value=1), step)
+                    writer.add_image('test_generation', make_grid(f_prime.contiguous().view(-1, 3, 64, 64), N-M, pad_value=1), step)
+                    writer.add_image('test_reconstruction', make_grid(f_hat.contiguous().view(-1, 3, 64, 64), N, pad_value=1), step)
 
             step += 1
             
