@@ -1,2 +1,1 @@
-# torch-jump
-PyTorch Implementation of JUMP (Consistent Generative Query Networks)
+# PyTorch Implementation of JUMP (Consistent Generative Query Networks)
