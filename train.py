@@ -13,7 +13,6 @@ from scheduler import AnnealingStepLR
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Query Network Implementation')
-#     parser.add_argument('--gradient_steps', type=int, default=2*10**6, help='number of gradient steps to run (default: 2 million)')
     parser.add_argument('--batch_size', type=int, default=36, help='size of batch (default: 36)')
     parser.add_argument('--dataset', type=str, default='Room', help='dataset (dafault: Room)')
     parser.add_argument('--train_data_dir', type=str, help='location of training data', \
@@ -84,7 +83,7 @@ if __name__ == '__main__':
         nf_v=1
         alpha=2.0
         beta=0.5
-#     elif D=='MNISTDice':
+    # elif D=='MNISTDice':
     else:
         nt=6
         stride_to_hidden=2
@@ -95,8 +94,8 @@ if __name__ == '__main__':
         nf_dec=128
         nf_z=3
         nf_v=5
-#     else:
-#         raise NotImplementedError
+    # else:
+        # raise NotImplementedError
         
     # Define model
     model = JUMP(nt, stride_to_hidden, nf_to_hidden, nf_enc, stride_to_obs, nf_to_obs, nf_dec, nf_z, nf_v).to(device)
